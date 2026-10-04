@@ -123,7 +123,9 @@ def generate_launch_description():
         executable='imu_visualizer',
         name='imu_visualizer',
         output='screen',
-        parameters=[{'publish_rate': 20.0}],
+        # RViz attitude markers are diagnostic only; 5 Hz keeps them readable
+        # without spending a Python process on 20 marker arrays each second.
+        parameters=[{'publish_rate': 5.0}],
     )
 
     cm029_teleop = Node(

@@ -1796,6 +1796,7 @@ class SyntheticForwardProposal : public BT::StatefulActionNode
 public:
   using BT::StatefulActionNode::StatefulActionNode;
   static inline bool blocked = false, planning = false, detours = false, block_direct = false;
+  static inline bool direct_lower_bound = false;
   static inline int cancels = 0;
   static inline std::vector<double> distances;
   static inline std::vector<std::string> requests;
@@ -1833,7 +1834,7 @@ private:
     if (!request.empty()) {
       // Deliberately offer the longest valid route first. The lattice offers
       // the shortest route last; first-success planning must not accept arcs.
-      const double extra = request == "Direct" ? 6.0 :
+      const double extra = request == "Direct" ? (direct_lower_bound ? 0.0 : 6.0) :
         request == "DirectArc" ? 5.0 :
         request == "GridShortest" ? 4.5 :
         request == "GridBased" ? 4.0 : request == "SE2Arc" ? 2.0 : 0.0;
@@ -1899,6 +1900,7 @@ protected:
     SyntheticForwardProposal::blocked = SyntheticForwardProposal::planning =
       SyntheticForwardProposal::detours = false;
     SyntheticForwardProposal::block_direct = false;
+    SyntheticForwardProposal::direct_lower_bound = false;
     SyntheticForwardProposal::cancels = 0; SyntheticForwardProposal::distances.clear();
     SyntheticForwardProposal::requests.clear();
     SyntheticForwardProposal::goal_yaw = 0.0;
@@ -1949,6 +1951,32 @@ TEST_F(ForwardSearchBTTest, CurrentPoseComparesAllPlannersAndChoosesShortestLast
   ASSERT_EQ(ExecuteRankedRoute::executed.size(), 1u);
   EXPECT_DOUBLE_EQ(ExecuteRankedRoute::executed[0], 2.0);
   EXPECT_EQ(board->get<std::string>("selected_planner"), "SE2Fallback");
+}
+
+TEST_F(ForwardSearchBTTest, ValidDirectLowerBoundSkipsExpensivePlannerTrials)
+{
+  SyntheticForwardProposal::direct_lower_bound = true;
+  geometry_msgs::msg::PoseStamped goal;
+  goal.header.frame_id = "map";
+  goal.pose.position.x = 2.0;
+  goal.pose.orientation.w = 1.0;
+  board->set("goal", goal);
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<RankedRouteSearch forward_search='false' explore_forward_detours='true' "
+    "goal='{goal}' candidate_distance='{distance}' candidate_planner_request='{request}' "
+    "candidate_path='{candidate}' candidate_planner='{candidate_planner}' "
+    "controller_error='{controller}' path='{selected}' planner_id='{selected_planner}'>"
+    "<SyntheticForwardProposal distance='{distance}' request='{request}' "
+    "path='{candidate}' planner='{candidate_planner}'/>"
+    "<CheckRankedRoute path='{selected}'/><ExecuteRankedRoute path='{selected}'/>"
+    "</RankedRouteSearch></BehaviorTree></root>", board);
+  EXPECT_EQ(complete(), BT::NodeStatus::SUCCESS);
+  EXPECT_EQ(SyntheticForwardProposal::requests,
+    (std::vector<std::string>{"Direct"}));
+  ASSERT_EQ(ExecuteRankedRoute::executed.size(), 1u);
+  EXPECT_DOUBLE_EQ(ExecuteRankedRoute::executed[0], 2.0);
+  EXPECT_EQ(board->get<std::string>("selected_planner"), "Direct");
 }
 
 TEST_F(ForwardSearchBTTest, SuccessfulRecoveryRouteFinishesWithoutAnotherFollowPath)

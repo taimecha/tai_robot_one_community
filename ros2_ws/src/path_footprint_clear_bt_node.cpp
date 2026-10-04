@@ -1814,6 +1814,7 @@ public:
           current_planners[proposal_]));
         const auto result = children_nodes_[0]->executeTick();
         if (result == BT::NodeStatus::RUNNING) {return result;}
+        bool direct_is_xy_lower_bound = false;
         if (result == BT::NodeStatus::SUCCESS) {
           auto path = getInput<nav_msgs::msg::Path>("candidate_path").value();
           std::vector<TrackingPose> poses;
@@ -1827,8 +1828,23 @@ public:
           }
           const double score = routePreference(poses);
           if (std::isfinite(score)) {
+            const auto planner = getInput<std::string>("candidate_planner").value();
+            if (!forward && !forward_proposal && !approach_proposal &&
+              proposal_ == 0 && goal_seen_ &&
+              (planner == "Direct" || planner == "DirectReverse") &&
+              path.poses.size() >= 2 && path.header.frame_id == goal_.header.frame_id)
+            {
+              const auto & start = path.poses.front().pose.position;
+              const auto & end = path.poses.back().pose.position;
+              const double lower_bound = std::hypot(
+                goal_.pose.position.x - start.x, goal_.pose.position.y - start.y);
+              direct_is_xy_lower_bound =
+                std::hypot(end.x - goal_.pose.position.x,
+                end.y - goal_.pose.position.y) < .005 &&
+                std::abs(length - lower_bound) < .01;
+            }
             choices_.push_back({std::move(path),
-                getInput<std::string>("candidate_planner").value(), score, length,
+                planner, score, length,
                 std::max(1.0, departure + 0.05)});
             RCLCPP_INFO(rclcpp::get_logger("forward_route_search"),
               "Checked candidate: departure %.2f m, planner %s, length %.3f m, motion score %.3f m",
@@ -1836,7 +1852,16 @@ public:
           }
         }
         haltChild(0);
-        ++proposal_;
+        // A body-checked direct segment equals the Euclidean lower bound.
+        // No longer candidate can improve XY distance; the fresh-route check
+        // still runs before FollowPath and on every BT tick while moving.
+        if (direct_is_xy_lower_bound) {
+          proposal_ = current_count;
+          RCLCPP_INFO(rclcpp::get_logger("forward_route_search"),
+            "Checked direct route reaches XY lower bound; skip longer planner trials");
+        } else {
+          ++proposal_;
+        }
         return BT::NodeStatus::RUNNING;
       }
       std::stable_sort(choices_.begin(), choices_.end(),

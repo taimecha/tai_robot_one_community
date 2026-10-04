@@ -745,3 +745,42 @@ check validates it again during motion. Synthetic tests verified a continuous
 clear corner and fallback when a cell blocks only the moving fillet. The three
 relevant CTest groups passed. This is a local code change; the old live Nav2
 process must be restarted before a robot trial can establish its effect.
+
+## Pi 5 CPU and shortest route review, 2026-10-02
+
+The state immediately before this change was pushed to the public repository
+at `a992d59`. In a three to four second idle sample, the real Pi spent about
+18% of one core in `bt_navigator`, 22% in the ESP32 IMU bridge, 19% in the
+RViz-only IMU visualizer, and another 6-18% each across many independent
+Nav2 processes. This is roughly two cores of combined CPU even without a
+goal. The standard real launch started smoother, route, waypoint and docking
+servers although its NavigateToPose tree does not call them.
+
+The real launch now starts only controller, planner, behavior, velocity
+smoother, collision monitor and BT navigator, with those six managed by the
+navigation lifecycle manager. Localization and the physical safety command
+chain remain active. The real BT loop checks at 20 Hz instead of 100 Hz;
+the local costmap still updates at 8 Hz but publishes at 4 Hz rather than 8;
+the RViz-only IMU markers publish at 5 Hz rather than 20; and the IMU bridge
+polls its 50 Hz ESP32 feed at 100 Hz rather than 200 Hz. These numbers are
+configuration changes, not measured CPU reductions: the current processes
+continue using the old settings until an operator restart.
+
+The route search now stops comparing planners after a validated current-pose
+Direct candidate exactly matches the Euclidean start-to-goal XY lower bound.
+Its normal fresh-footprint validation and collision monitor remain in place.
+When Direct is blocked, the other planners still compete by checked route
+length. A synthetic test verifies that a valid Direct candidate skips later
+planner calls; existing ranked-route tests still cover the blocked/longer
+alternatives.
+
+For the pictured S path, the selected goal ran from about (3.389, 1.460) to
+(3.094, -0.364) with final heading 180 degrees. A straight XY path would
+travel at about -99 degrees, requiring an 81-degree final pivot. The live
+planning log rejected Direct at the first accepted 5 cm XY point and chose
+a 2.376 m lattice path versus 1.848 m straight XY distance. The costmap
+captured after the goal also showed a lethal cell touched by the full padded
+footprint during the exact-goal pivot. Because that capture is later than
+planning, it is supporting geometry, not a replay of the original map. The
+new route preference therefore does not force this straight line when the
+specified 5-degree final heading cannot be reached safely.

@@ -73,6 +73,13 @@ def _nav2_actions(context, nav2_share, params_file):
             'amcl.ros__parameters.alpha2': '0.02',
             'amcl.ros__parameters.alpha3': '0.05',
             'amcl.ros__parameters.alpha4': '0.05',
+            # The selected path is checked at each BT tick. 20 Hz is faster
+            # than one 2.5 cm costmap cell at the robot's cruise speed and
+            # avoids rebuilding two costmaps 100 times per second.
+            'bt_navigator.ros__parameters.bt_loop_duration': '50',
+            # Keep obstacle updates at 8 Hz; publish the 200x200 local grid
+            # at 4 Hz for RViz and the route validator.
+            'local_costmap.local_costmap.ros__parameters.publish_frequency': '4.0',
             'collision_monitor.ros__parameters.source_timeout': '0.5',
             # Real robot: keep the costmap footprint and swept-footprint
             # approach checking, but remove the extra red stop envelope.
@@ -106,13 +113,44 @@ def _nav2_actions(context, nav2_share, params_file):
             os.path.join(nav2_share, 'launch', 'localization_launch.py')),
         launch_arguments={**common, 'map': map_file}.items(),
     )
-    navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(nav2_share, 'launch', 'navigation_launch.py')),
-        launch_arguments={
-            **common,
-            'autostart': LaunchConfiguration('navigation_autostart'),
-        }.items(),
+    # RViz NavigateToPose uses these six servers. The generic Nav2 bringup
+    # starts four more independent processes (smoother, route, waypoint and
+    # docking) that this robot's navigation tree never calls.
+    nav_specs = [
+        ('nav2_controller', 'controller_server', 'controller_server', True),
+        ('nav2_planner', 'planner_server', 'planner_server', False),
+        ('nav2_behaviors', 'behavior_server', 'behavior_server', True),
+        ('nav2_velocity_smoother', 'velocity_smoother', 'velocity_smoother', True),
+        ('nav2_collision_monitor', 'collision_monitor', 'collision_monitor', False),
+        ('nav2_bt_navigator', 'bt_navigator', 'bt_navigator', False),
+    ]
+    nav_nodes = []
+    for package, executable, name, sends_cmd_vel in nav_specs:
+        remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+        if sends_cmd_vel:
+            remappings.append(('cmd_vel', 'cmd_vel_nav'))
+        nav_nodes.append(Node(
+            package=package,
+            executable=executable,
+            name=name,
+            output='screen',
+            parameters=[configured_params],
+            arguments=['--ros-args', '--log-level', 'info'],
+            remappings=remappings,
+        ))
+    nav_nodes.append(Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[
+            {'autostart': LaunchConfiguration('navigation_autostart')},
+            {'node_names': [spec[2] for spec in nav_specs]},
+        ],
+        arguments=['--ros-args', '--log-level', 'info'],
+    ))
+    navigation = GroupAction(
+        actions=nav_nodes,
         condition=IfCondition(LaunchConfiguration('start_navigation')),
     )
     return [

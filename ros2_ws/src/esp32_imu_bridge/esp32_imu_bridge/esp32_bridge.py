@@ -82,7 +82,9 @@ class ESP32ImuBridge(Node):
         self.lift_homed = False
         self.lift_command_quiet_required = True
         self.last_lift_command_received = 0.0
-        self.create_timer(0.005, self.poll_serial)
+        # ESP32 sends IMU frames at 50 Hz. Poll at 100 Hz; the buffered reader
+        # still drains every complete frame with at most 10 ms receive delay.
+        self.create_timer(0.01, self.poll_serial)
         self.create_timer(0.1, self.send_lift_heartbeat)
         self.get_logger().info(
             f'IMU bridge configured: {self.port} at {self.baud} baud -> '
