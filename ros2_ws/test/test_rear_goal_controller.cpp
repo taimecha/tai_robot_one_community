@@ -117,6 +117,30 @@ TEST(RearGoalController, ReversesWithoutHalfTurnStopsAtToleranceAndChecksRearCol
   command = controller.computeVelocityCommands(pose, velocity, nullptr);
   EXPECT_DOUBLE_EQ(command.twist.linear.x, 0);
   EXPECT_GT(command.twist.angular.z, 0);
+  // The shorter terminal rotation hits a newly observed fork obstacle. The
+  // opposite complete sweep remains clear and must stay committed each tick.
+  map->getCostmap()->setCost(mx, my, nav2_costmap_2d::FREE_SPACE);
+  nav_msgs::msg::Path turn;
+  turn.header.frame_id = "map";
+  geometry_msgs::msg::PoseStamped at;
+  at.pose.position.x = 2;
+  at.pose.position.y = 2;
+  at.pose.orientation.w = 1;
+  turn.poses.push_back(at);
+  at.pose.position.x = 2.03;
+  at.pose.orientation.z = std::sin(2.4 / 2);
+  at.pose.orientation.w = std::cos(2.4 / 2);
+  turn.poses.push_back(at);
+  ASSERT_TRUE(map->getCostmap()->worldToMap(2.0, 2.70, mx, my));
+  map->getCostmap()->setCost(mx, my, nav2_costmap_2d::LETHAL_OBSTACLE);
+  update(2, 2, 0);
+  controller.setPlan(turn);
+  velocity = geometry_msgs::msg::Twist{};
+  command = controller.computeVelocityCommands(pose, velocity, nullptr);
+  EXPECT_LT(command.twist.angular.z, 0);
+  update(2, 2, -.60);
+  command = controller.computeVelocityCommands(pose, velocity, nullptr);
+  EXPECT_LT(command.twist.angular.z, 0);
   controller.deactivate(); controller.cleanup();
   map->on_cleanup(rclcpp_lifecycle::State());
   map.reset(); node.reset(); tf.reset();

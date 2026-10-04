@@ -294,8 +294,46 @@ TEST_F(FootprintBTTest, TerminalPivotCanLeaveOnlyExistingGlobalPaddingContact)
   rclcpp::sleep_for(std::chrono::milliseconds(40));
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
   local_map.data[85 * 160 + 112] = 0;
-  // Even an existing global contact inside the core remains blocking.
-  map.data[80 * 160 + 109] = 254;
+  // A map-only contact in the chassis core away from the fork tip remains blocking.
+  map.data[80 * 160 + 88] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, TerminalPivotCanLeaveExistingMapOnlyForkTipContact)
+{
+  split_frames = true;
+  local_map = map;
+  local_map.header.frame_id = "odom";
+  // Existing static-map contact under the front tip, inside the core body.
+  // The local obstacle map observes free space there.
+  map.data[76 * 160 + 110] = 254;
+  map.data[80 * 160 + 112] = 254;  // Enters only in the first 0.25 rad of the fork-tip sweep.
+  geometry_msgs::msg::PoseStamped goal;
+  goal.header.frame_id = "map";
+  goal.pose.orientation.z = std::sin(.6 / 2);
+  goal.pose.orientation.w = std::cos(.6 / 2);
+  board->set("goal", goal);
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear motion='direct' goal='{goal}' checked_path='{path}'/>"
+    "</BehaviorTree></root>", board);
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // A new obstacle in the swept corridor remains blocking.
+  map.data[98 * 160 + 106] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  map.data[98 * 160 + 106] = 0;
+  local_map.data[80 * 160 + 112] = 254;  // Same cell observed by live local sensing.
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  local_map.data[80 * 160 + 112] = 0;
+  // Unknown current body occupancy must not be released.
+  map.data[76 * 160 + 110] = 255;
   publish();
   rclcpp::sleep_for(std::chrono::milliseconds(40));
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
@@ -754,6 +792,49 @@ TEST_F(FootprintBTTest, ReverseReleasesOnlyMapPaddingContactWithClearLocalAndCle
   // A new obstacle behind the actual starting body still forbids release.
   map.data[80 * 160 + 61] = 254;
   rclcpp::sleep_for(std::chrono::milliseconds(220));
+  publish(); rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, ReverseLeavesExistingMapOnlyFrontForkSideContact)
+{
+  split_frames = true;
+  local_map = map;
+  local_map.header.frame_id = "odom";
+  // A static-map cell on the front fork side is already under the robot,
+  // but the live local map and the full rear corridor are clear.
+  map.data[87 * 160 + 102] = 254;  // x=0.5625, y=0.1875
+  selectMotion("reverse_needed");
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // A new obstacle beyond the original rear edge is never released.
+  map.data[80 * 160 + 58] = 254;
+  rclcpp::sleep_for(std::chrono::milliseconds(220));
+  publish(); rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, PlannerTimeoutAllowsCheckedRearEscapeFromMapOnlyStartContact)
+{
+  split_frames = true;
+  local_map = map;
+  local_map.header.frame_id = "odom";
+  map.data[87 * 160 + 102] = 254;
+  selectMotion("recovery_allowed");
+  auto goal = board->get<geometry_msgs::msg::PoseStamped>("goal");
+  goal.pose.position.x = -.62;
+  board->set("goal", goal);
+  board->set<uint16_t>("planner", 207);
+  connect();
+  ASSERT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  selectMotion("reverse_needed");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // A locally observed obstacle cannot use this map-only exception.
+  local_map.data[87 * 160 + 102] = 254;
+  selectMotion("recovery_allowed");
+  board->set("goal", goal);
+  board->set<uint16_t>("planner", 207);
   publish(); rclcpp::sleep_for(std::chrono::milliseconds(40));
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
 }
@@ -1464,7 +1545,7 @@ TEST_F(FootprintBTTest, RunningTurnValidatesRemainingSweepWithoutRevisitingOldHe
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
 }
 
-TEST_F(FootprintBTTest, PreparedTerminalTurnStillRequiresShortestFinalSweep)
+TEST_F(FootprintBTTest, PreparedTerminalTurnUsesClearOppositeSweep)
 {
   nav_msgs::msg::Path path;
   path.header.frame_id = "map";
@@ -1482,7 +1563,88 @@ TEST_F(FootprintBTTest, PreparedTerminalTurnStillRequiresShortestFinalSweep)
     "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
     "<PathFootprintClear path='{path}' prepared='true'/></BehaviorTree></root>", board);
   connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // Both complete sweeps blocked: no rotation is authorized.
+  map.data[80 * 160 + 51] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, ShortGoalKeepsCheckingRemainingTurnAfterSmallXYDrift)
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  geometry_msgs::msg::PoseStamped point;
+  point.pose.orientation.w = 1.0;
+  path.poses.push_back(point);
+  point.pose.position.x = -.03;  // The requested XY already lies within 5 cm.
+  point.pose.orientation.z = std::sin(1.5 / 2);
+  point.pose.orientation.w = std::cos(1.5 / 2);
+  path.poses.push_back(point);
+  board->set("path", path);
+  robot_transform.translation.x = .08;  // Drift while the terminal turn runs.
+  robot_transform.rotation.z = std::sin(1.0 / 2);
+  robot_transform.rotation.w = std::cos(1.0 / 2);
+  // A cell on the already traversed heading would block a return to the
+  // path's original yaw, but the remaining 1.0 -> 1.5 rad sweep is clear.
+  map.data[85 * 160 + 115] = 254;
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear path='{path}' planner_id='Direct' prepared='true'/>"
+    "</BehaviorTree></root>", board);
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // A newly occupied cell on the remaining fork sweep must still stop it.
+  map.data[109 * 160 + 94] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, BlockedTerminalPivotPrefersCheckedRetreatOverForwardDetour)
+{
+  // The goal XY is already reached. Obstacles on both sides of the fork
+  // block the complete turns, while the first 16 cm behind are clear.
+  map.data[108 * 160 + 80] = 254;
+  map.data[52 * 160 + 80] = 254;
+  geometry_msgs::msg::PoseStamped goal;
+  goal.header.frame_id = "map";
+  goal.pose.position.x = .03;
+  goal.pose.orientation.z = std::sin(2.4 / 2);
+  goal.pose.orientation.w = std::cos(2.4 / 2);
+  board->set("goal", goal);
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  geometry_msgs::msg::PoseStamped start;
+  start.pose.orientation.w = 1.0;
+  path.poses.push_back(start);
+  auto detour = start;
+  detour.pose.position.x = .30;
+  path.poses.push_back(detour);
+  path.poses.push_back(goal);
+  board->set("path", path);
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear motion='direct' goal='{goal}' "
+    "blocked_near_robot='{blocked}'/></BehaviorTree></root>", board);
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  EXPECT_TRUE(board->get<bool>("blocked"));
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear path='{path}' goal='{goal}' planner_id='SE2Fallback' "
+    "blocked_near_robot='{blocked}'/></BehaviorTree></root>", board);
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  EXPECT_TRUE(board->get<bool>("blocked"));
+  selectMotion("recovery_allowed");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  selectMotion("reverse_needed");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
 }
 
 TEST_F(FootprintBTTest, TurnLimitSkipsFutilePathsUntilRealEscapeTranslation)

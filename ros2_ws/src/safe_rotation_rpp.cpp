@@ -179,7 +179,8 @@ public:
       goal_xy_error < xy_tolerance && goal_xy_error > 0.015 &&
       end.position.x > 0.015 && std::abs(end.position.y) < 0.9 * xy_tolerance &&
       std::abs(goal_yaw_error) > yaw_tolerance &&
-      !sweepClear(pose, yaw, goal_yaw_error);
+      !chooseRotation(goal_yaw_error,
+        [&](double sweep) {return sweepClear(pose, yaw, sweep);});
     if (defer_terminal_pivot) {
       turning_ = false;
       aligning_terminal_yaw_ = false;
@@ -214,9 +215,9 @@ public:
     }
     if (has_reached_xy_tolerance_ || aligning_terminal_yaw_) {
       angle = goal_yaw_error;
-        // Arrival always tracks the current shortest signed yaw error.
-        // A latched long sweep or a little overshoot must not cause a full lap.
-      turning_ = false;
+      // Keep a validated long sweep committed until it finishes. Resetting
+      // here on every control tick would repeatedly choose the blocked short
+      // direction instead of continuing through the clear side.
     }
     if (!aligning_terminal_yaw_ && terminalReverseCorrectionAllowed(
         end.position.x, end.position.y, remaining_length, xy_tolerance,
@@ -264,7 +265,7 @@ public:
       if (std::abs(angle) > threshold) {
         const auto chosen = chooseRotation(angle,
             [&](double sweep) {return sweepClear(pose, yaw, sweep);},
-          !goal_rotation && std::hypot(end.position.x, end.position.y) > 0.50);
+          goal_rotation || std::hypot(end.position.x, end.position.y) > 0.50);
         if (!chosen) {
           rotation_blocked_ = true;
           throw nav2_core::NoValidControl("Both complete heading sweeps blocked; replan required");

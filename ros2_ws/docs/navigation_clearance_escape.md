@@ -784,3 +784,81 @@ footprint during the exact-goal pivot. Because that capture is later than
 planning, it is supporting geometry, not a replay of the original map. The
 new route preference therefore does not force this straight line when the
 specified 5-degree final heading cannot be reached safely.
+
+## Near-goal rotation and retreat, 2026-10-04
+
+For a goal only 3.4 cm from the robot, the October 4 log shows a direct
+terminal turn blocked after it began, followed by a 0.606 m forward detour.
+The detour stopped where the rear corridor was blocked and planning then
+reported `Start occupied`. Terminal validation and the controller now check
+both complete rotation directions. The controller keeps a chosen long turn
+through subsequent control ticks. If both directions are blocked at an
+already reached goal XY, a checked 16 cm rear corridor takes precedence over
+forward detours, and continuous retreat seeks a safe turning pocket. A blocked
+rear corridor still forbids reverse motion. The 5 cm XY and 5 degree yaw goal
+tolerances are unchanged.
+
+The first physical replay of the latest RViz goal, (3.607, 1.284) at
+-1.598 rad, still aborted from (3.085, 1.610): a static-map lethal cell lay
+inside the front fork side of the current footprint although the live local
+lidar costmap was clear. An isolated replay of the captured costmaps reproduced
+the refusal to reverse. The retreat check now permits release of that existing
+map-only contact in a private validation map only when it is in the front fork
+side or extra footprint padding, the local map is clear, and the full reverse
+corridor and original-map endpoint are clear. A nearby goal behind the chassis
+also reaches this checked recovery branch when the planner reports bounded
+search timeout 207. These conditions do not clear the published costmap or
+permit reverse through a new obstacle.
+
+After rebuilding and restarting Nav2, a second live replay of the same goal
+succeeded in 45.6 s. The robot reversed about 0.16 m, replanned from the new
+pose, and followed a checked 0.451 m route. The final stationary TF was about
+(3.597, 1.256), yaw -1.658 rad, approximately 3.0 cm and 3.5 degrees from
+the requested pose. The relevant CTest groups passed before the physical run.
+
+## Short heading goal interrupted during turn, 2026-10-04
+
+The latest RViz goal was (3.237, 1.429), yaw -1.564 rad, just 2.8 cm from
+the starting XY (3.26, 1.41). Nav2 correctly selected a Direct 2.8 cm path,
+but stopped its turn after about eight seconds as the estimated XY shifted to
+(3.318, 1.361). The prepared-path validator then rechecked the old initial
+heading instead of the remaining part of the turn. A 55 cm retreat and a
+1.079 m SE2Fallback detour followed; the goal ultimately aborted. The map
+capture after the event suggests the short turn passes a static-map wall,
+and the opposite long turn meets other obstacles. The later capture is not
+proof of the exact obstacles present during the goal.
+
+For a Direct goal whose initial XY is already within the 5 cm tolerance, the
+prepared-path check now validates the remaining yaw sweep from the robot's
+actual pose during a bounded 12 cm pivot drift. It still checks both current
+costmaps and the full body. Once yaw is reached or drift exceeds that bound,
+the normal path validation applies; the 5 cm / 5 degree goal checker remains
+unchanged. A regression test reproduced rejection of a clear remaining sweep
+and verifies that a newly occupied cell on that sweep still stops the turn.
+The full footprint BT test group passed locally, with one unrelated optional
+capture replay skipped.
+
+A first physical yaw-only retry from (3.250, 1.631), yaw 197.3 degrees, to
+-89.6 degrees stayed still and aborted after 27.2 s. A fresh global/local
+costmap capture and isolated replay found an existing static-map lethal cell
+under the front fork tip, although the local lidar costmap was clear there.
+During the first few degrees of the positive turn, rasterization brought two
+more cells of the same map wall under the fork. The negative long turn met
+other occupied cells. The terminal pivot check now releases existing map-only
+cells in the extra footprint padding, plus fork-tip cells in the first
+0.25 rad of the sweep within 0.70-0.86 m forward and 0.16 m laterally, only
+when those cells are clear in the live local map. The original global map
+must be clear after that initial
+sweep and at the goal; every live local obstacle still blocks the full turn.
+The published costmaps remain unchanged. Isolated replay of the exact captured
+maps then accepted the positive 73.1 degree turn. Synthetic tests kept a
+new obstacle in the later sweep, a locally observed fork contact, unknown
+cells, and core-body contacts outside the fork tip blocked.
+
+After installation and Nav2 restart, a new yaw-only physical test at the
+current XY (3.251, 1.632) reached -89.6 degrees in 5.2 s with zero recoveries.
+The maximum XY displacement in feedback was 3.6 cm. Stationary TF afterward
+was (3.289, 1.645), yaw -91.4 degrees: approximately 4.0 cm and 1.8 degrees
+from that requested pose. The full footprint BT test group passed: 106
+tests, one optional capture test skipped; the captured-costmap replay also
+passed separately.
