@@ -6,7 +6,9 @@
   Rank complete routes via checked forward starts before local escape.
   Advance only along a full checked route or to a checked turning/exit pocket.
   BackUp stays active continuously until an exit is available at the current pose.
-  Do not clear obstacle data and do not blindly spin into an obstacle.
+  After a route failure, clear stale dynamic obstacles once, wait for fresh
+  sensor costmaps, then retry before attempting a physical escape maneuver.
+  Never clear costmaps periodically while following a valid route.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
@@ -15,7 +17,19 @@
     <WaitForClearanceData/>
     <RecoveryNode number_of_retries="2" name="ReconsiderFreshRoutesBeforeAbort">
     <RecoveryNode number_of_retries="2147483647" name="NavigateUntilEscapeBlocked">
-      <SubTree ID="RankedCurrentRoutes" select_route_only="false" refresh_blocked_route="true" max_route_length="2.5" _autoremap="true"/>
+      <RecoveryNode number_of_retries="1" name="RefreshStaleLidarAndCameraBeforeEscape">
+        <SubTree ID="RankedCurrentRoutes" select_route_only="false" refresh_blocked_route="true" max_route_length="2.5" _autoremap="true"/>
+        <Sequence name="ClearAndReobserveDynamicObstacles">
+          <PathFootprintClear data_only="true"/>
+          <PathFootprintClear motion="motion_fault_free" goal="{goal}" controller_error="{follow_path_error_code}"/>
+          <BeginCostmapRefresh/>
+          <ClearEntireCostmap name="ClearGlobalDynamicObstacles" service_name="global_costmap/clear_entirely_global_costmap" server_timeout="2000"/>
+          <ClearEntireCostmap name="ClearLocalDynamicObstacles" service_name="local_costmap/clear_entirely_local_costmap" server_timeout="2000"/>
+          <WaitForRefreshedCostmaps timeout="3.0"/>
+          <PathFootprintClear data_only="true"/>
+          <ResetEscapeState invalidate_path="true"/>
+        </Sequence>
+      </RecoveryNode>
       <ReactiveFallback name="EscapeBeforeGivingUp">
         <GoalUpdated/>
         <Sequence name="TryForwardThenRetreat">

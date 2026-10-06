@@ -330,7 +330,8 @@ Monitor phát hiện cột kệ cao `0.680 m` và pallet có tải trong vùng n
 đặt ở cao độ `0.385 m` có thể quét vượt qua. LiDAR mô phỏng và xe thật cùng
 dùng transform từ `base_footprint`: `x=-0.2115 m`, `y=0`, `z=0.385 m`,
 `yaw=-2°`. Camera mô phỏng ở cao độ `0.8 m`, có góc pitch URDF `+20°` để
-quét xuống phía trước; transform camera xe thật vẫn giữ hiệu chuẩn hiện hành.
+quét xuống phía trước; camera xe thật cũng dùng góc pitch `+20°` theo bản
+preview của `detect_astra_pro`.
 Mô phỏng bật camera theo mặc định; `/camera/obstacle_scan` cấp vật cản
 cho cả costmap và Collision Monitor. Camera không bảo đảm thấy pallet trống
 cao khoảng `35 mm` ở vùng gần dưới tầm sâu `0.6 m`, vật phía sau hoặc ngoài

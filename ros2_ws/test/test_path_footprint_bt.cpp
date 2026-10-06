@@ -2847,7 +2847,7 @@ TEST_F(FootprintBTTest, RealEscapeTreeLoadsWithInstalledNav2PortContracts)
 {
   for (const auto & lib : {
     "compute_path_to_pose_action", "follow_path_action", "wait_action",
-    "back_up_action", "drive_on_heading", "spin_action", "pipeline_sequence",
+    "back_up_action", "drive_on_heading", "spin_action", "clear_costmap_service", "pipeline_sequence",
     "rate_controller", "recovery_node",
     "goal_updated_condition", "globally_updated_goal_condition"})
   {
@@ -2857,7 +2857,7 @@ TEST_F(FootprintBTTest, RealEscapeTreeLoadsWithInstalledNav2PortContracts)
   // Preserve the real Nav2 port declarations, but replace action builders
   // so tree construction never contacts hardware or requires action servers.
   for (const auto & name : {"ComputePathToPose", "FollowPath", "Wait", "BackUp", "DriveOnHeading",
-      "Spin"})
+      "Spin", "ClearEntireCostmap"})
   {
     const auto manifest = factory.manifests().at(name);
     factory.unregisterBuilder(name);
@@ -2868,6 +2868,45 @@ TEST_F(FootprintBTTest, RealEscapeTreeLoadsWithInstalledNav2PortContracts)
   }
   board->set("goal", geometry_msgs::msg::PoseStamped{});
   EXPECT_NO_THROW(factory.createTreeFromFile(REAL_ESCAPE_TREE, board));
+}
+
+TEST_F(FootprintBTTest, StaleCostmapRefreshCanRunOnceForEachGoal)
+{
+  auto refresh = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<BeginCostmapRefresh/></BehaviorTree></root>", board);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::SUCCESS);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::FAILURE);
+
+  auto reset = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<ResetEscapeState reset_motion_history='true'/>"
+    "</BehaviorTree></root>", board);
+  EXPECT_EQ(reset.tickOnce(), BT::NodeStatus::SUCCESS);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::SUCCESS);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, ClearedCostmapRetryWaitsForBothNewMaps)
+{
+  auto wait = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<WaitForRefreshedCostmaps timeout='2.0'/>"
+    "</BehaviorTree></root>", board);
+  EXPECT_EQ(wait.tickOnce(), BT::NodeStatus::RUNNING);
+  rclcpp::sleep_for(std::chrono::milliseconds(450));
+  map.header.stamp = node->now();
+  global->publish(map);
+  EXPECT_EQ(wait.tickOnce(), BT::NodeStatus::RUNNING);
+  local->publish(map);
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  BT::NodeStatus result = BT::NodeStatus::RUNNING;
+  while (std::chrono::steady_clock::now() < until &&
+    result == BT::NodeStatus::RUNNING) {
+    result = wait.tickOnce();
+    rclcpp::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_EQ(result, BT::NodeStatus::SUCCESS);
 }
 
 TEST_F(FootprintBTTest, NoValidPathAllowsLocalRecoveryOnlyWithGeometricEvidence)

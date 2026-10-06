@@ -440,7 +440,7 @@
     </xacro:if>
     <xacro:unless value="$(arg use_sim)">
         <xacro:mast_sensor_mount parent="mast_frame" include_lidar="false"
-                                 camera_pitch="${-20.0 * pi / 180.0}"/>
+                                 camera_pitch="${20.0 * pi / 180.0}"/>
     </xacro:unless>
     <!-- Both lidars use the validated temporary chassis mount. -->
     <xacro:fork_mast_lidar parent="base_footprint"

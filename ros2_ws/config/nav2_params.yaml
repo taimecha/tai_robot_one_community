@@ -219,9 +219,9 @@ local_costmap:
           obstacle_max_range: 6.00
           raytrace_min_range: 0.60
           raytrace_max_range: 6.00
-          # Do not clear costmap cells through an invalid / occluded camera
-          # ray.  The independent lidar remains a clearing observation source.
-          inf_is_valid: false
+          # A no-return camera ray clears only this camera layer, so a moved
+          # low obstacle does not remain marked after the next depth scan.
+          inf_is_valid: true
       fork_safety_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
@@ -304,9 +304,8 @@ global_costmap:
           obstacle_max_range: 6.00
           raytrace_min_range: 0.60
           raytrace_max_range: 6.00
-          # Do not clear the static map through an invalid / occluded camera
-          # ray.  The independent lidar remains a clearing observation source.
-          inf_is_valid: false
+          # Clear old camera marks without changing the independent static map.
+          inf_is_valid: true
       fork_safety_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true

@@ -13,7 +13,6 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import (
-    AnyLaunchDescriptionSource,
     PythonLaunchDescriptionSource,
 )
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -77,9 +76,16 @@ def _nav2_actions(context, nav2_share, params_file):
             # than one 2.5 cm costmap cell at the robot's cruise speed and
             # avoids rebuilding two costmaps 100 times per second.
             'bt_navigator.ros__parameters.bt_loop_duration': '50',
-            # Keep obstacle updates at 8 Hz; publish the 200x200 local grid
-            # at 4 Hz for RViz and the route validator.
-            'local_costmap.local_costmap.ros__parameters.publish_frequency': '4.0',
+            # Update the local obstacle grid at the selected rate. Publishing
+            # its full 200x200 grid at 4 Hz keeps RViz/network work bounded.
+            'local_costmap.local_costmap.ros__parameters.publish_frequency':
+                LaunchConfiguration('local_costmap_publish_hz'),
+            'local_costmap.local_costmap.ros__parameters.update_frequency':
+                LaunchConfiguration('local_costmap_update_hz'),
+            'global_costmap.global_costmap.ros__parameters.update_frequency':
+                LaunchConfiguration('global_costmap_update_hz'),
+            'global_costmap.global_costmap.ros__parameters.publish_frequency':
+                LaunchConfiguration('global_costmap_publish_hz'),
             'collision_monitor.ros__parameters.source_timeout': '0.5',
             # Real robot: keep the costmap footprint and swept-footprint
             # approach checking, but remove the extra red stop envelope.
@@ -166,7 +172,6 @@ def generate_launch_description():
     package_share = get_package_share_directory('tai_robot_one')
     nav2_share = get_package_share_directory('nav2_bringup')
     lidar_share = get_package_share_directory('sllidar_ros2')
-    astra_share = get_package_share_directory('astra_camera')
     params_file = os.path.join(package_share, 'config', 'nav2_params.yaml')
 
     real_hardware = IncludeLaunchDescription(
@@ -201,72 +206,11 @@ def generate_launch_description():
     )
 
     camera = IncludeLaunchDescription(
-        AnyLaunchDescriptionSource(os.path.join(
-            astra_share, 'launch', 'astra_pro.launch.xml')),
-        launch_arguments={
-            'enable_point_cloud': 'true',
-            'enable_colored_point_cloud': 'false',
-            # Never accumulate old depth frames while creating the point cloud.
-            'queue_size': '1',
-            'enable_ir': 'false',
-            'tf_publish_rate': '0.0',
-            'color_width': '640',
-            'color_height': '480',
-            'color_fps': '15',
-            'depth_width': '320',
-            'depth_height': '240',
-            # Astra only supports this depth mode at 30 Hz. Throttle the cloud
-            # downstream so the driver does not silently fall back at runtime.
-            'depth_fps': '30',
-        }.items(),
-        condition=IfCondition(LaunchConfiguration('use_camera')),
-    )
-
-    camera_compressed = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
-            package_share, 'launch', 'camera_compressed.launch.py')),
-        condition=IfCondition(LaunchConfiguration('use_camera')),
-    )
-
-    depth_throttle = Node(
-        package='topic_tools',
-        executable='throttle',
-        name='depth_raw_throttle',
-        output='screen',
-        arguments=[
-            'messages',
-            '/camera/depth/image_raw',
-            '10.0',
-            '/camera/depth/image_raw_10fps',
-        ],
-        condition=IfCondition(LaunchConfiguration('use_camera')),
-    )
-
-    camera_obstacle_scan = Node(
-        package='pointcloud_to_laserscan',
-        executable='pointcloud_to_laserscan_node',
-        name='camera_obstacle_scan',
-        output='screen',
-        remappings=[
-            ('cloud_in', '/camera/depth/points'),
-            ('scan', '/camera/obstacle_scan'),
-        ],
-        parameters=[{
-            'use_sim_time': False,
-            'target_frame': 'base_footprint',
-            'transform_tolerance': 0.10,
-            # Reject floor noise from the real camera pitched 20 degrees down.
-            'min_height': 0.12,
-            'max_height': 0.75,
-            'angle_min': -0.5235987756,
-            'angle_max': 0.5235987756,
-            'angle_increment': 0.01745329252,
-            'queue_size': 1,
-            'scan_time': 0.10,
-            'range_min': 0.60,
-            'range_max': 6.00,
-            'use_inf': True,
-        }],
+            package_share, 'launch', 'astra_obstacles.launch.py')),
+        launch_arguments={
+            'camera_scan_hz': LaunchConfiguration('camera_scan_hz'),
+        }.items(),
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
@@ -316,6 +260,21 @@ def generate_launch_description():
             'use_camera', default_value='true',
             description='Start Astra and enable camera obstacle sources'),
         DeclareLaunchArgument(
+            'camera_scan_hz', default_value='20.0',
+            description='Maximum published low-obstacle scan rate on the Pi'),
+        DeclareLaunchArgument(
+            'local_costmap_update_hz', default_value='10.0',
+            description='Local costmap update rate; full grid publishes at 4 Hz'),
+        DeclareLaunchArgument(
+            'local_costmap_publish_hz', default_value='4.0',
+            description='Local full-grid publish rate for RViz and route checks'),
+        DeclareLaunchArgument(
+            'global_costmap_update_hz', default_value='2.5',
+            description='Global costmap update rate; full grid publishes at 1 Hz'),
+        DeclareLaunchArgument(
+            'global_costmap_publish_hz', default_value='1.0',
+            description='Global full-grid publish rate for RViz and route checks'),
+        DeclareLaunchArgument(
             'restore_saved_pose', default_value='true',
             description='Restore and persist the last AMCL pose'),
         DeclareLaunchArgument(
@@ -329,9 +288,6 @@ def generate_launch_description():
         lidar,
         scan_filter,
         camera,
-        camera_compressed,
-        depth_throttle,
-        camera_obstacle_scan,
         nav_path_display_filter,
         TimerAction(
             period=LaunchConfiguration('localization_delay'),

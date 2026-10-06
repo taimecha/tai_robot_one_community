@@ -231,6 +231,7 @@ struct ClearanceData
   geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint;
   // Shared across recovery conditions, but not carried into a new goal.
   bool turn_collision{false};
+  bool costmap_refresh_used{false};
   double collision_min_retreat{0.15};
   bool failed_forward{false};
   geometry_msgs::msg::PoseStamped collision_goal;
@@ -2280,6 +2281,7 @@ public:
     if (getInput<bool>("reset_motion_history").value()) {
       std::shared_ptr<ClearanceData> data;
       if (config().blackboard->get("tai_clearance_data", data)) {
+        data->costmap_refresh_used = false;
         data->completed_goal_valid = false;
         data->turn_collision = false;
         data->failed_forward = false;
@@ -2307,6 +2309,74 @@ public:
     return BT::NodeStatus::SUCCESS;
   }
 };
+
+// Run the potentially expensive clear/reobserve cycle at most once per goal.
+// A genuine obstacle must continue through the checked escape logic instead
+// of repeatedly erasing both maps while the robot is stationary.
+class BeginCostmapRefresh final : public BT::SyncActionNode
+{
+public:
+  using BT::SyncActionNode::SyncActionNode;
+  static BT::PortsList providedPorts() {return {};}
+  BT::NodeStatus tick() override
+  {
+    std::shared_ptr<ClearanceData> data;
+    if (!config().blackboard->get("tai_clearance_data", data) ||
+      data->costmap_refresh_used)
+    {return BT::NodeStatus::FAILURE;}
+    data->costmap_refresh_used = true;
+    RCLCPP_INFO(data->node->get_logger(),
+      "Route blocked: clear stale lidar/camera costmaps once and reobserve before retry");
+    return BT::NodeStatus::SUCCESS;
+  }
+};
+
+// A clear service returns before the obstacle layers have necessarily
+// incorporated another sensor frame. Require both published costmaps to move
+// beyond the clear and one update interval before retrying a route.
+class WaitForRefreshedCostmaps final : public BT::StatefulActionNode
+{
+public:
+  using BT::StatefulActionNode::StatefulActionNode;
+  static BT::PortsList providedPorts()
+  {
+    return {BT::InputPort<double>("timeout", 3.0, "Maximum sensor reobservation wait in seconds")};
+  }
+  BT::NodeStatus onStart() override
+  {
+    if (!config().blackboard->get("tai_clearance_data", data_)) {
+      return BT::NodeStatus::FAILURE;
+    }
+    started_ = std::chrono::steady_clock::now();
+    cleared_at_ = data_->node->now();
+    return check();
+  }
+  BT::NodeStatus onRunning() override {return check();}
+  void onHalted() override {}
+
+private:
+  BT::NodeStatus check()
+  {
+    data_->executor.spin_some();
+    const auto elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started_).count();
+    const double timeout = getInput<double>("timeout").value();
+    if (elapsed > timeout) {
+      RCLCPP_WARN(data_->node->get_logger(),
+        "Costmaps did not publish new sensor observations after clearing");
+      return BT::NodeStatus::FAILURE;
+    }
+    const auto refreshed = [&](const nav2_msgs::msg::Costmap::ConstSharedPtr & map) {
+        return map && rclcpp::Time(map->header.stamp) >
+               cleared_at_ + rclcpp::Duration::from_seconds(0.4);
+      };
+    return refreshed(data_->global) && refreshed(data_->local) ?
+           BT::NodeStatus::SUCCESS : BT::NodeStatus::RUNNING;
+  }
+  std::shared_ptr<ClearanceData> data_;
+  std::chrono::steady_clock::time_point started_;
+  rclcpp::Time cleared_at_{0, 0, RCL_ROS_TIME};
+};
 }  // namespace tai_robot_one
 
 BT_REGISTER_NODES(factory)
@@ -2315,5 +2385,7 @@ BT_REGISTER_NODES(factory)
   factory.registerNodeType<tai_robot_one::ForwardRouteSearch>("ForwardRouteSearch");
   factory.registerNodeType<tai_robot_one::ForwardRouteSearch>("RankedRouteSearch");
   factory.registerNodeType<tai_robot_one::ResetEscapeState>("ResetEscapeState");
+  factory.registerNodeType<tai_robot_one::BeginCostmapRefresh>("BeginCostmapRefresh");
+  factory.registerNodeType<tai_robot_one::WaitForRefreshedCostmaps>("WaitForRefreshedCostmaps");
   factory.registerNodeType<tai_robot_one::WaitForClearanceData>("WaitForClearanceData");
 }
