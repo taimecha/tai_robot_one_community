@@ -1571,6 +1571,63 @@ TEST_F(FootprintBTTest, PreparedTerminalTurnUsesClearOppositeSweep)
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
 }
 
+TEST_F(FootprintBTTest, NearGoalSpinChoosesOpenSideAndRetreatsIfBothSidesBlock)
+{
+  geometry_msgs::msg::PoseStamped goal;
+  goal.header.frame_id = "map";
+  goal.pose.position.x = .01;
+  goal.pose.orientation.z = std::sin(2.7 / 2);
+  goal.pose.orientation.w = std::cos(2.7 / 2);
+  board->set("goal", goal);
+  // The front fork hits this cell only during the positive turn. The long
+  // negative sweep reaches the same yaw through the open side.
+  map.data[102 * 160 + 102] = 254;
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear motion='terminal_turn' goal='{goal}' turn_angle='{angle}'/>"
+    "</BehaviorTree></root>", board);
+  connect();
+  ASSERT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  EXPECT_LT(board->get<double>("angle"), -3.0);
+
+  // Once the other side also blocks, no pivot is authorized; checked local
+  // recovery may inspect the rear corridor instead.
+  map.data[58 * 160 + 102] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  selectMotion("route_control_available");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  selectMotion("direct");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  selectMotion("recovery_allowed");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  selectMotion("reverse_needed");
+  board->set("goal", goal);
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+}
+
+TEST_F(FootprintBTTest, ExistingMapOnlyForkTipContactAllowsCheckedRetreat)
+{
+  split_frames = true;
+  local_map = map;
+  local_map.header.frame_id = "odom";
+  // A saved-map cell sits under the centre of the front tip. Live lidar is
+  // clear, and moving back 30 cm leaves that cell behind the full body.
+  map.data[80 * 160 + 110] = 254;
+  selectMotion("reverse_needed");
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  // A newly sensed object at the same tip remains a hard stop.
+  local_map.data[80 * 160 + 110] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(230));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
 TEST_F(FootprintBTTest, ShortGoalKeepsCheckingRemainingTurnAfterSmallXYDrift)
 {
   nav_msgs::msg::Path path;
@@ -1836,6 +1893,56 @@ TEST_F(FootprintBTTest, ForwardRouteIncludesActualDepartureAndExactGoal)
   goal.pose.position.x = 0.90;
   board->set("goal", goal);
   map.data[80 * 160 + 72] = 254;  // Rear of current body, absent at future start.
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
+TEST_F(FootprintBTTest, ForwardPocketEnablesCheckedStraightRemainder)
+{
+  geometry_msgs::msg::PoseStamped start, goal;
+  start.header.frame_id = goal.header.frame_id = "map";
+  start.pose.orientation.w = 1.0;
+  start.pose.position.x = .60;
+  goal.pose.position.x = .60;
+  goal.pose.position.y = 1.0;
+  goal.pose.orientation.z = std::sin(1.57079632679 / 2);
+  goal.pose.orientation.w = std::cos(1.57079632679 / 2);
+  board->set("candidate", start);
+  board->set("goal", goal);
+  map.data[108 * 160 + 80] = 254;  // Blocks the initial pivot, not the pocket at x=.60.
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear motion='forward_direct' candidate_start='{candidate}' "
+    "goal='{goal}' checked_path='{joined}' path_planner='{planner}'/>"
+    "</BehaviorTree></root>", board);
+  connect();
+  ASSERT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  const auto joined = board->get<nav_msgs::msg::Path>("joined");
+  EXPECT_EQ(board->get<std::string>("planner"), "Direct");
+  EXPECT_NEAR(joined.poses.front().pose.position.x, 0.0, 1e-9);
+  double length = 0.0;
+  bool pivot_at_pocket = false;
+  for (size_t i = 1; i < joined.poses.size(); ++i) {
+    const auto & a = joined.poses[i - 1].pose;
+    const auto & b = joined.poses[i].pose;
+    const double d = std::hypot(b.position.x - a.position.x, b.position.y - a.position.y);
+    length += d;
+    if (d < .001 && std::abs(tf2::getYaw(b.orientation) - tf2::getYaw(a.orientation)) > 1.0) {
+      pivot_at_pocket = true;
+      EXPECT_NEAR(b.position.x, .60, 1e-8);
+      EXPECT_NEAR(b.position.y, 0.0, 1e-8);
+    }
+  }
+  EXPECT_TRUE(pivot_at_pocket);
+  EXPECT_NEAR(length, 1.60, 1e-8);
+  // A fresh obstacle on the straight remainder is not bypassed by the new candidate.
+  map.data[116 * 160 + 104] = 254;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+  map.data[116 * 160 + 104] = 0;
+  map.data[80 * 160 + 72] = 254;  // Actual departure footprint, absent at the pocket.
   publish();
   rclcpp::sleep_for(std::chrono::milliseconds(40));
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);

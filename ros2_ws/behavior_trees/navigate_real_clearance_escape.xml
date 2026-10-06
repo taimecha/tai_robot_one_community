@@ -33,10 +33,13 @@
                     <PathFootprintClear data_only="true"/>
                     <Sequence>
                       <PathFootprintClear motion="forward_candidate" goal="{goal}" candidate_distance="{forward_route_distance}" forward_start="{forward_route_start}"/>
+                      <Fallback>
+                        <PathFootprintClear motion="forward_direct" candidate_start="{forward_route_start}" goal="{goal}" checked_path="{forward_candidate_path}" path_planner="{forward_candidate_planner}" blocked_near_robot="{forward_candidate_blocked}"/>
                       <Sequence>
                         <ComputePathToPose goal="{goal}" start="{forward_route_start}" use_start="true" path="{forward_candidate_path}" planner_id="{forward_planner_request}" error_code_id="{forward_route_planner_error}"/>
                         <PathFootprintClear motion="forward_route" path="{forward_candidate_path}" candidate_start="{forward_route_start}" goal="{goal}" planner_id="{forward_planner_request}" checked_path="{forward_candidate_path}" path_planner="{forward_candidate_planner}" blocked_near_robot="{forward_candidate_blocked}"/>
                       </Sequence>
+                      </Fallback>
                     </Sequence>
                   </ReactiveSequence>
                   <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{forward_route_local_range}" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
@@ -108,6 +111,19 @@
   </BehaviorTree>
   <BehaviorTree ID="RankedCurrentRoutes">
     <Fallback>
+    <Sequence name="NearGoalCheckedSpin">
+      <PathFootprintClear motion="terminal_turn" goal="{goal}" turn_angle="{terminal_turn_angle}"/>
+      <Fallback>
+        <Sequence>
+          <Spin spin_dist="{terminal_turn_angle}" time_allowance="25.0" error_code_id="{terminal_turn_error}"/>
+          <PathFootprintClear motion="goal_pose_reached" goal="{goal}"/>
+        </Sequence>
+        <Sequence>
+          <PathFootprintClear motion="turn_collision" goal="{goal}" motion_error="{terminal_turn_error}"/>
+          <AlwaysFailure/>
+        </Sequence>
+      </Fallback>
+    </Sequence>
     <PathFootprintClear motion="goal_completed" goal="{goal}"/>
     <Sequence>
     <PathFootprintClear motion="route_control_available" goal="{goal}"/>
@@ -138,8 +154,13 @@
           </Switch6>
           <Sequence name="CompareForwardDepartureBeforeAcceptingDetour">
             <PathFootprintClear motion="forward_candidate" goal="{goal}" candidate_distance="{route_departure_distance}" forward_start="{route_departure_start}"/>
+            <Fallback>
+              <PathFootprintClear motion="forward_direct" candidate_start="{route_departure_start}" goal="{goal}" checked_path="{route_candidate_path}" path_planner="{route_candidate_planner}" blocked_near_robot="{local_escape_required}"/>
+            <Sequence>
             <ComputePathToPose goal="{goal}" start="{route_departure_start}" use_start="true" path="{route_candidate_path}" planner_id="{route_planner_request}" error_code_id="{compute_path_error_code}"/>
             <PathFootprintClear motion="forward_route" path="{route_candidate_path}" candidate_start="{route_departure_start}" goal="{goal}" planner_id="{route_planner_request}" checked_path="{route_candidate_path}" path_planner="{route_candidate_planner}" blocked_near_robot="{local_escape_required}"/>
+            </Sequence>
+            </Fallback>
           </Sequence>
           <Sequence name="AlignBeforeEnteringConstrainedGoal">
             <PathFootprintClear motion="goal_approach_candidate" goal="{goal}" candidate_distance="{route_departure_distance}" approach_goal="{route_approach_goal}"/>

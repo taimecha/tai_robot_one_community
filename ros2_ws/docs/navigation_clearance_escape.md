@@ -862,3 +862,82 @@ was (3.289, 1.645), yaw -91.4 degrees: approximately 4.0 cm and 1.8 degrees
 from that requested pose. The full footprint BT test group passed: 106
 tests, one optional capture test skipped; the captured-costmap replay also
 passed separately.
+
+## Straight route after a checked departure, 2026-10-04
+
+The tested rotation/retreat state was pushed as `57b17be` before this change.
+The latest pictured successful goal ran from approximately (0.855, -0.442)
+to (3.500499, 0.369664), yaw 1.586412 rad. Direct was rejected at its launch
+turn; subsequent departures competed only through GridBased, SE2Arc and
+SE2Fallback. Multiple costmap updates stopped selected routes. After a retreat,
+the final successful SE2Arc route measured 4.611 m. A later global/static/lidar
+capture showed the straight translation corridor clear; it does not establish
+that the launch or terminal turn was clear during planning.
+
+Each checked forward departure now tries an explicit stationary turn followed
+by a dense straight segment to the exact goal before requesting a planner.
+The actual forward prefix, pocket turn, full-body translation and terminal
+yaw are validated together with the normal global and nearby local costmaps.
+The route participates in the same length ranking. When it fits, later planner
+calls at that same departure are skipped because they cannot shorten its
+straight remainder; other departure distances are still compared. If it does
+not fit, existing planner alternatives remain available. No footprint, obstacle
+threshold or goal tolerance was reduced.
+
+A synthetic obstacle that blocks the initial pivot but leaves a forward
+pocket clear verified a 0.60 m departure plus exactly 1.00 m straight remainder.
+Fresh obstacles on that remainder or under the actual launch body rejected
+the candidate. The full footprint BT suite and real Nav2 XML construction
+passed. The pictured goal has already finished; this new departure candidate
+has not been physically replayed from its original starting pose.
+
+## Near-goal pivot direction, 2026-10-06
+
+The latest yaw-only goal began near (3.66, 0.59) and requested yaw -1.5503 rad.
+The previous Direct route accepted a short pivot after releasing an existing
+map-only fork-tip contact. About five seconds later, a few centimetres of pose
+change made the remaining footprint sweep fail; repeated route searches found
+no checked path and Nav2 aborted. The log does not prove which physical object
+the fork touched, but it does show that the first pivot validation was too
+fragile for this position.
+
+At an already accepted goal XY, the BT now checks both complete signed turns
+with the full body, 4 cm pose shifts and a 0.06 rad stopping margin. It sends
+the selected signed angle to Nav2 Spin, so the executed direction is the one
+validated against the global and live local costmaps. If neither direction
+fits, the existing checked recovery inspects the rear corridor. A collision
+reported by Spin excludes another attempt at the same near-goal pivot before
+the robot has moved. The 5 cm / 5 degree goal tolerances are unchanged.
+The synthetic blocked-side test and the complete BT test group passed:
+108 passed, one optional replay skipped. Nav2 was rebuilt and restarted;
+this particular physical goal has not been replayed yet.
+
+Follow-up after the next live goals: the 4 cm pivot reserve rejected the
+nearby turns, and recovery also rejected reverse at the same fixed pose.
+A read-only capture at (3.669, 0.565), yaw -20.5 degrees showed six lethal
+static-map cells under the centre of the front fork tip (0.71-0.78 m ahead),
+while the live local costmap had no lethal cell inside the footprint. The
+retreat map-contact release previously covered the fork sides but not the
+centre tip, although the pivot check already covered this tip. Checked reverse
+now admits only these existing map-only tip cells when the live local cells
+are clear; the complete retreat corridor and endpoint on the original map
+must still be free. Captured-costmap replay accepts reverse from the actual
+pose and from hypothetical positions 5 cm and 10 cm farther back. A synthetic
+test confirms a newly observed local obstacle at the tip still stops retreat.
+Nav2 was restarted after the build to load this correction.
+
+Live follow-up on 2026-10-06: a yaw-only goal still aborted without motion.
+The near-goal sweep requested checked retreat, but `route_control_available`
+and the later unprepared path probe cleared `terminal_escape_needed` before
+`recovery_allowed` could reach BackUp. Those route probes now preserve the
+pending escape request. A regression test exercises the complete sequence
+from a blocked near-goal turn through route selection to `reverse_needed`.
+The full BT suite passed (109 passed, one optional capture replay skipped).
+
+After rebuilding and restarting Nav2, a bounded real goal 0.30 m behind the
+stationary robot at (3.669, 0.563), yaw -20.5 degrees, used continuous checked
+retreat. The robot moved about 0.25 m and Nav2 reported `Goal succeeded` at
+(3.428, 0.648), 4.4 cm from the requested XY. A second bounded yaw-only goal
+at that position requested -0.75 rad; the checked sweep selected the negative
+23.2-degree turn, and Nav2 reported `Goal succeeded` in about two seconds at
+yaw -0.771 rad, with about 2 cm XY drift. No GitHub push was made.

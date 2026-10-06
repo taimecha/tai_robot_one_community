@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Explicit, bounded real-robot Nav2 test. Run only with operator authorization.
 
-Sends one short forward goal with unchanged heading through normal Nav2.
-Cancels on stale LiDAR/odometry, unexpected reverse/rotation, excess travel or
+Sends one short forward or reverse goal with unchanged heading through normal Nav2.
+Cancels on stale LiDAR/odometry, unexpected travel direction/rotation, excess travel or
 timeout. Never bypasses the smoother, Collision Monitor or base watchdog.
 """
 import argparse
@@ -34,8 +34,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=35.0)
     parser.add_argument('--heading', type=float, help='Explicit goal/travel yaw in map radians')
     args = parser.parse_args()
-    if not 0 <= args.distance <= 0.60 or not 5 <= args.timeout <= 60:
-        parser.error('Distance must be 0..0.60 m; timeout 5..60 s')
+    if not -0.60 <= args.distance <= 0.60 or not 5 <= args.timeout <= 60:
+        parser.error('Distance must be -0.60..0.60 m; timeout 5..60 s')
     if args.heading is not None and not math.isfinite(args.heading):
         parser.error('Heading must be finite')
     rclpy.init()
@@ -127,12 +127,12 @@ def main():
             delta = math.atan2(math.sin(delta), math.cos(delta))
             if now - state['scan_received'] > 0.6 or now - state['odom_received'] > 0.5:
                 reason = 'stale_sensor'
-            elif travel > args.distance + 0.20:
+            elif travel > abs(args.distance) + 0.20:
                 reason = 'excess_travel'
             elif abs(delta) > math.radians(35):
                 reason = 'unexpected_rotation'
-            elif 'command' in state and state['command'].linear.x < -0.015:
-                reason = 'unexpected_reverse'
+            elif 'command' in state and args.distance * state['command'].linear.x < -0.00015:
+                reason = 'unexpected_travel_direction'
             elif now - started > args.timeout:
                 reason = 'timeout'
             if reason:
