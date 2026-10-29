@@ -887,7 +887,7 @@ class Processor:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', type=Path, default=Path(__file__).resolve().parent/'models/best_v2.pt')
+    parser.add_argument('--model', type=Path, default=Path(__file__).resolve().parent/'models/best_v3.pt')
     parser.add_argument('--manual-edge', action='store_true', help='Optional manual A/B diagnostic mode; default is automatic')
     parser.add_argument('--show-old-point', action='store_true', help='Legacy option; press O to toggle the old comparison point')
     parser.add_argument('--conf', type=float, default=0.60,

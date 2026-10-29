@@ -34,7 +34,7 @@ IMGSZ = 640
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = PROJECT_DIR / "models" / "best_v2.pt"
+MODEL_PATH = PROJECT_DIR / "models" / "best_v3.pt"
 
 
 print("=" * 60)

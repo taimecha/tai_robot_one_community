@@ -1,6 +1,6 @@
 # Astra Pallets
 
-Nhận diện và phân đoạn pallet từ camera RGB Astra Pro bằng YOLO. Model có một lớp `pallets` và được lưu tại `models/best_v2.pt`.
+Nhận diện và phân đoạn pallet cùng hàng hóa từ camera RGB Astra Pro bằng YOLO. Model mặc định là `models/best_v3.pt`, gồm ba lớp `Box`, `emty pallet` và `pallets`. Node `/pallet/target` chỉ chọn các lớp pallet để đo, bỏ qua lớp `Box`.
 
 ## Cài đặt
 

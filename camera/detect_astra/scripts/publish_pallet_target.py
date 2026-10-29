@@ -134,10 +134,13 @@ def process_pair(pair, model, args, node, history):
     depth = decode_image(depth_msg, depth=True)
     results = model.predict(image, conf=args.conf, imgsz=640,
                             retina_masks=True, device=args.device, verbose=False)[0]
-    if results.masks is None or len(results.boxes) != 1:
-        raise ValueError(f'expected one pallet, found {len(results.boxes)}')
-    mask = results.masks.data[0].cpu().numpy().astype(bool)
-    bbox = results.boxes.xyxy[0].cpu().numpy()
+    pallet_indices = [i for i, cls in enumerate(results.boxes.cls)
+                      if results.names[int(cls.item())].strip().lower() in ('pallets', 'emty pallet')]
+    if results.masks is None or len(pallet_indices) != 1:
+        raise ValueError(f'expected one pallet, found {len(pallet_indices)}')
+    pallet_index = pallet_indices[0]
+    mask = results.masks.data[pallet_index].cpu().numpy().astype(bool)
+    bbox = results.boxes.xyxy[pallet_index].cpu().numpy()
     measurement = measure_pallet_target(
         mask, bbox, depth, intrinsics, pitch_deg=args.pitch_deg,
         inverse_depth_x_slope=args.inverse_depth_x_slope,
@@ -162,13 +165,13 @@ def process_pair(pair, model, args, node, history):
                  'left_forward_m', 'right_forward_m', 'left_depth_samples',
                  'right_depth_samples'):
         setattr(msg, name, measurement[name])
-    msg.yolo_confidence = float(results.boxes.conf[0].item())
+    msg.yolo_confidence = float(results.boxes.conf[pallet_index].item())
     return msg
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', type=Path, default=PROJECT / 'models/best_v2.pt')
+    parser.add_argument('--model', type=Path, default=PROJECT / 'models/best_v3.pt')
     parser.add_argument('--correction-yaml', type=Path,
                         default=PROJECT / 'config/calibration/astra_pro_depth_x_skew_preview.yaml')
     parser.add_argument('--device', default='0' if torch.cuda.is_available() else 'cpu')
