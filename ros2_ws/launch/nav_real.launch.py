@@ -228,6 +228,8 @@ def generate_launch_description():
             package_share, 'launch', 'astra_obstacles.launch.py')),
         launch_arguments={
             'camera_scan_hz': LaunchConfiguration('camera_scan_hz'),
+            'camera_cloud_pixel_stride':
+                LaunchConfiguration('camera_cloud_pixel_stride'),
         }.items(),
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
@@ -278,8 +280,11 @@ def generate_launch_description():
             'use_camera', default_value='true',
             description='Start Astra and enable camera obstacle sources'),
         DeclareLaunchArgument(
-            'camera_scan_hz', default_value='20.0',
+            'camera_scan_hz', default_value='15.0',
             description='Maximum published low-obstacle scan rate on the Pi'),
+        DeclareLaunchArgument(
+            'camera_cloud_pixel_stride', default_value='2',
+            description='Depth pixel spacing in the calibrated cloud'),
         DeclareLaunchArgument(
             'local_costmap_update_hz', default_value='10.0',
             description='Local costmap update rate; full grid publishes at 4 Hz'),

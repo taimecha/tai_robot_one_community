@@ -1,19 +1,21 @@
 # Nav2 GitHub + Astra Pro trên Raspberry Pi 5
 
-Nền Nav2 là commit `381bbe6` của `taimecha/tai_robot_one`. Mã camera được
-chép nguyên từ commit `a41f409` của `taimecha/detect_astra_pro` vào
-`camera/detect_astra_pro/`; launch `astra_obstacles.launch.py` lấy thông số
-depth và quét vật cản từ `pallet_obstacle_preview.launch.py`. Không thay đổi
-planner, controller hoặc bộ lọc LiDAR của nền GitHub. Behavior tree chỉ thêm
+Nền Nav2 bắt đầu từ commit `381bbe6` của `taimecha/tai_robot_one`. Mã camera
+hiện dùng `taimecha/detect_astra` commit
+`fbb2d113753a76ae2c8afbbd788be2a493527b00` trong `camera/detect_astra/`.
+Launch `astra_obstacles.launch.py` lấy cloud Depth hiệu chỉnh rồi chuyển sang
+`/camera/obstacle_scan`; chi tiết tại [astra_detect_astra_scan.md](astra_detect_astra_scan.md).
+Behavior tree thêm
 một lần xóa global/local costmap cho mỗi goal khi không tìm được đường, đợi cả
 hai costmap nhận dữ liệu cảm biến mới rồi thử lại. Nó không xóa costmap định kỳ khi xe đang
 đi theo một đường hợp lệ. Bộ lọc
 dây camera thử trước đó không có trong bản này.
 
-Camera thật: depth 320×240 @ 30 fps, chỉ bật depth và point cloud; RGB/YOLO
-không chạy khi điều hướng. Điểm 3D được đổi trực tiếp sang scan gồm 61 tia,
-lọc theo cao độ 6–75 cm và tầm 0,6–6 m. Góc camera trong URDF là +20° như
-preview. Chỉ scan nhỏ được giới hạn tần số; không giới hạn point cloud lớn.
+Camera thật: Depth đăng ký theo RGB ở 640×480 @ 30 fps, RGB 640×480 @ 15 fps.
+Node cloud dùng hiệu chuẩn RGB và hệ số sửa Depth theo cột ảnh, lấy mẫu cách
+2 pixel ở tối đa 15 Hz; YOLO không chạy khi điều hướng. Scan dùng bước góc
+0,5°, lọc theo cao độ 6–75 cm và tầm 0,6–6 m. Góc camera trong URDF là +20°.
+Cloud gốc của driver được tắt để giảm tải CPU.
 Hai camera obstacle layer chấp nhận tia không có vật cản để xóa dấu camera cũ;
 lớp bản đồ tĩnh và LiDAR độc lập.
 
@@ -21,16 +23,14 @@ Giá trị mặc định trên Pi 5:
 
 | Thành phần | Giá trị cấu hình | Đã đo khi chỉ chạy camera |
 | --- | ---: | ---: |
-| `/camera/obstacle_scan` | tối đa 20 Hz | khoảng 16,6 Hz |
+| `/camera/obstacle_scan` | tối đa 15 Hz | khoảng 15 Hz |
 | Local costmap update | 10 Hz | chờ thử cùng Nav2 |
 | Local costmap publish | 4 Hz | chờ thử cùng Nav2 |
 | Global costmap update | 2,5 Hz | chờ thử cùng Nav2 |
 | Global costmap publish | 1 Hz | chờ thử cùng Nav2 |
 
-Trước tích hợp lại, một phiên Nav2 trên Pi đo được camera scan khoảng 19 Hz
-khi không giới hạn, nhưng việc phát nhiều scan hơn mức costmap cần làm tăng
-tải. Ở phép thử camera riêng, đặt bộ giới hạn 15 Hz chỉ đạt khoảng 11 Hz do
-nhịp depth 30 fps; đặt 20 Hz đạt 16,6 Hz. Với 10 Hz local costmap, độ dịch
+Pipeline mới đã được thử riêng camera, TF và bộ chuyển cloud trên Pi 5;
+chưa đo tải khi chạy cùng Nav2. Với 10 Hz local costmap, độ dịch
 chuyển ở tốc độ 0,28 m/s vào khoảng 2,8 cm mỗi lần cập nhật, gần độ phân giải
 2,5 cm của costmap. Giá trị này chưa được xác nhận khi robot di chuyển.
 
@@ -47,10 +47,9 @@ ros2 launch tai_robot_one nav_real.launch.py \
 ```
 
 Các tham số dòng lệnh có thể đổi mà không sửa Nav2:
-`camera_scan_hz:=20.0`, `local_costmap_update_hz:=10.0`,
+`camera_scan_hz:=15.0`, `camera_cloud_pixel_stride:=2`, `local_costmap_update_hz:=10.0`,
 `local_costmap_publish_hz:=4.0`, `global_costmap_update_hz:=2.5`, và
-`global_costmap_publish_hz:=1.0`. Nếu CPU gần đầy, thử `15.0`, `8.0`, `2.0`
-theo đúng thứ tự đó. Kiểm tra bằng `ros2 topic hz /camera/obstacle_scan` và
+`global_costmap_publish_hz:=1.0`. Kiểm tra bằng `ros2 topic hz /camera/obstacle_scan` và
 `ros2 param get /local_costmap/local_costmap update_frequency`;
 `ros2 param get /global_costmap/global_costmap update_frequency`.
 

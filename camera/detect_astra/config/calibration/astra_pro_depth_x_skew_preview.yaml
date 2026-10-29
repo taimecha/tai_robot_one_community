@@ -1,0 +1,11 @@
+# Empirical preview from flat-floor rows at three pallet distances (2026-10-11).
+# Camera roll was measured as 0 degrees. Slope is in 1/m/pixel.
+# Preserve raw Z around u=370, the right-side region reported most accurate.
+# This does not calibrate absolute range, mounting pitch, or RGB/Depth alignment.
+/spatial_depth_cloud:
+  ros__parameters:
+    pixel_stride: 3
+    max_rate_hz: 10.0
+    inverse_depth_x_slope: 0.00015807
+    reference_u: 370.0
+    output_topic: /camera/depth/points_spatial_corrected_preview
