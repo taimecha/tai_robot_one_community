@@ -9,6 +9,8 @@ import tempfile
 import time
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from lifecycle_msgs.msg import State
+from lifecycle_msgs.srv import GetState
 import rclpy
 from rclpy.node import Node
 
@@ -41,6 +43,9 @@ class AmclPosePersistence(Node):
 
         self.publisher = self.create_publisher(
             PoseWithCovarianceStamped, '/initialpose', 10)
+        self.amcl_state_client = self.create_client(GetState, '/amcl/get_state')
+        self.amcl_state_future = None
+        self.amcl_state_requested_at = 0.0
         self.subscription = self.create_subscription(
             PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
         delay = float(self.get_parameter('restore_delay').value)
@@ -49,6 +54,26 @@ class AmclPosePersistence(Node):
 
     def restore_once(self):
         if self.restored:
+            return
+        # AMCL discards /initialpose while inactive. Keep retrying its state
+        # instead of consuming the saved pose during a slow Nav2 startup.
+        if self.amcl_state_future is None:
+            if self.amcl_state_client.service_is_ready():
+                self.amcl_state_future = self.amcl_state_client.call_async(
+                    GetState.Request())
+                self.amcl_state_requested_at = time.monotonic()
+            return
+        if not self.amcl_state_future.done():
+            if time.monotonic() - self.amcl_state_requested_at > 3.0:
+                self.amcl_state_future = None
+            return
+        try:
+            state = self.amcl_state_future.result().current_state.id
+        except Exception as error:
+            self.get_logger().warning(f'Waiting for AMCL state: {error}')
+            state = None
+        self.amcl_state_future = None
+        if state != State.PRIMARY_STATE_ACTIVE:
             return
         self.restored = True
         self.restore_timer.cancel()

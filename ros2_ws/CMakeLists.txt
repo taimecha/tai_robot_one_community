@@ -182,6 +182,7 @@ install(
   PROGRAMS
     scripts/cmd_vel_stamper
     scripts/amcl_pose_persistence
+    scripts/wait_for_localization_tf
     scripts/astra_sim_range_filter
     scripts/nav_path_display_filter
     scripts/cm029_teleop

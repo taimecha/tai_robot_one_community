@@ -231,7 +231,8 @@ struct ClearanceData
   geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint;
   // Shared across recovery conditions, but not carried into a new goal.
   bool turn_collision{false};
-  bool costmap_refresh_used{false};
+  unsigned costmap_refresh_count{0};
+  std::chrono::steady_clock::time_point last_costmap_refresh{};
   double collision_min_retreat{0.15};
   bool failed_forward{false};
   geometry_msgs::msg::PoseStamped collision_goal;
@@ -290,6 +291,8 @@ public:
       BT::InputPort<double>("candidate_angle", 0.0, "Selected checked recovery turn"),
       BT::InputPort<geometry_msgs::msg::PoseStamped>("candidate_start"),
       BT::InputPort<double>("local_check_distance", 1.0, "Radius requiring live local checks"),
+      BT::InputPort<double>("execution_check_distance", 0.0,
+        "Check only this much remaining path during FollowPath; 0 checks the full route"),
       BT::InputPort<double>("goal_xy_tolerance", 0.05, "Match the shared goal checker XY tolerance"),
       BT::InputPort<double>("goal_yaw_tolerance", 0.0872664626,
         "Match the shared goal checker yaw tolerance"),
@@ -434,6 +437,11 @@ public:
       if (!std::isfinite(requested_range) || requested_range < 1.0 || requested_range > 1.30) {
         return BT::NodeStatus::FAILURE;
       }
+      const double execution_check_distance =
+        getInput<double>("execution_check_distance").value();
+      if (!std::isfinite(execution_check_distance) || execution_check_distance < 0.0 ||
+        execution_check_distance > 2.0)
+      {return BT::NodeStatus::FAILURE;}
       double local_range = requested_range;
       bool reverse_path = getInput<std::string>("planner_id").value() == "DirectReverse";
       nav_msgs::msg::Path path;
@@ -1201,7 +1209,16 @@ public:
         return BT::NodeStatus::FAILURE;
       }
       const size_t begin = starts_forward && distance < 0.03 ? nearest + 1 : nearest;
+      double checked_distance = distance;
       for (size_t i = begin; i < path.poses.size(); ++i) {
+        // Candidate selection checks the complete route. While FollowPath is
+        // already running, a newly marked cell near the distant goal must
+        // not interrupt a safe turn or translation here. Recheck that cell
+        // as the robot approaches it; keep the immediate swept body checked
+        // on every tick, including stationary turns and the final yaw sweep.
+        if (execution_check_distance > 0.0 && i > begin &&
+          checked_distance >= execution_check_distance)
+        {break;}
         const auto & p = path.poses[i].pose;
         const double a = tf2::getYaw(p.orientation);
         // RPP reaches the final XY first, then aligns the goal heading.
@@ -1231,6 +1248,11 @@ public:
             p.position.x, p.position.y, a * 180.0 / kPi);
           setOutput("blocked_near_robot", std::hypot(p.position.x - x, p.position.y - y) < 1.0);
           return BT::NodeStatus::FAILURE;
+        }
+        if (i > nearest) {
+          const auto & previous = path.poses[i - 1].pose.position;
+          checked_distance += std::hypot(
+            p.position.x - previous.x, p.position.y - previous.y);
         }
         px = p.position.x; py = p.position.y; pa = a;
       }
@@ -2281,7 +2303,8 @@ public:
     if (getInput<bool>("reset_motion_history").value()) {
       std::shared_ptr<ClearanceData> data;
       if (config().blackboard->get("tai_clearance_data", data)) {
-        data->costmap_refresh_used = false;
+        data->costmap_refresh_count = 0;
+        data->last_costmap_refresh = {};
         data->completed_goal_valid = false;
         data->turn_collision = false;
         data->failed_forward = false;
@@ -2310,23 +2333,45 @@ public:
   }
 };
 
-// Run the potentially expensive clear/reobserve cycle at most once per goal.
-// A genuine obstacle must continue through the checked escape logic instead
-// of repeatedly erasing both maps while the robot is stationary.
-class BeginCostmapRefresh final : public BT::SyncActionNode
+// A moving person can re-mark the costmap during the first clear. Retry only
+// while route search is blocked, at a bounded rate and count. The next route
+// remains fully body-checked after fresh sensor frames arrive.
+class BeginCostmapRefresh final : public BT::StatefulActionNode
 {
 public:
-  using BT::SyncActionNode::SyncActionNode;
-  static BT::PortsList providedPorts() {return {};}
-  BT::NodeStatus tick() override
+  using BT::StatefulActionNode::StatefulActionNode;
+  static BT::PortsList providedPorts()
+  {
+    return {
+      BT::InputPort<double>("cooldown", 3.0, "Minimum seconds between costmap clears"),
+      BT::InputPort<unsigned>("max_refreshes", 12, "Maximum clears for this goal")};
+  }
+  BT::NodeStatus onStart() override {return maybeRefresh();}
+  BT::NodeStatus onRunning() override {return maybeRefresh();}
+  void onHalted() override {}
+
+private:
+  BT::NodeStatus maybeRefresh()
   {
     std::shared_ptr<ClearanceData> data;
-    if (!config().blackboard->get("tai_clearance_data", data) ||
-      data->costmap_refresh_used)
+    if (!config().blackboard->get("tai_clearance_data", data)) {
+      return BT::NodeStatus::FAILURE;
+    }
+    const double cooldown = getInput<double>("cooldown").value();
+    const unsigned max_refreshes = getInput<unsigned>("max_refreshes").value();
+    if (!std::isfinite(cooldown) || cooldown < 0.0 || cooldown > 10.0 ||
+      max_refreshes == 0 || max_refreshes > 30 ||
+      data->costmap_refresh_count >= max_refreshes)
     {return BT::NodeStatus::FAILURE;}
-    data->costmap_refresh_used = true;
+    const auto now = std::chrono::steady_clock::now();
+    if (data->costmap_refresh_count > 0 &&
+      std::chrono::duration<double>(now - data->last_costmap_refresh).count() < cooldown)
+    {return BT::NodeStatus::RUNNING;}
+    data->last_costmap_refresh = now;
+    ++data->costmap_refresh_count;
     RCLCPP_INFO(data->node->get_logger(),
-      "Route blocked: clear stale lidar/camera costmaps once and reobserve before retry");
+      "Route blocked: clear and reobserve dynamic costmaps (%u/%u)",
+      data->costmap_refresh_count, max_refreshes);
     return BT::NodeStatus::SUCCESS;
   }
 };

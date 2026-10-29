@@ -67,7 +67,10 @@ def generate_launch_description():
                 'max_height': 0.75,
                 'angle_min': -0.5235987756,
                 'angle_max': 0.5235987756,
-                'angle_increment': 0.01745329252,
+                # At 2 m, half-degree rays are about 1.7 cm apart, closer
+                # than the local costmap's 2.5 cm cells. This lets free rays
+                # erase old marks after a person steps out of the corridor.
+                'angle_increment': 0.00872664626,
                 'queue_size': 1,
                 'scan_time': 0.05,
                 'range_min': 0.60,

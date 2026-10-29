@@ -9,9 +9,11 @@ from launch.actions import (
     GroupAction,
     IncludeLaunchDescription,
     OpaqueFunction,
+    RegisterEventHandler,
     TimerAction,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import (
     PythonLaunchDescriptionSource,
 )
@@ -132,7 +134,8 @@ def _nav2_actions(context, nav2_share, params_file):
     ]
     nav_nodes = []
     for package, executable, name, sends_cmd_vel in nav_specs:
-        remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+        remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static'),
+                      ('/scan', '/scan_filtered')]
         if sends_cmd_vel:
             remappings.append(('cmd_vel', 'cmd_vel_nav'))
         nav_nodes.append(Node(
@@ -159,11 +162,26 @@ def _nav2_actions(context, nav2_share, params_file):
         actions=nav_nodes,
         condition=IfCondition(LaunchConfiguration('start_navigation')),
     )
+    localization_gate = Node(
+        package='tai_robot_one',
+        executable='wait_for_localization_tf',
+        name='wait_for_localization_tf',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('start_navigation')),
+    )
+
+    def start_navigation_when_localized(event, _context):
+        return [navigation] if event.returncode == 0 else []
+
     return [
         GroupAction([
             SetRemap(src='/scan', dst='/scan_filtered'),
             localization,
-            navigation,
+            RegisterEventHandler(OnProcessExit(
+                target_action=localization_gate,
+                on_exit=start_navigation_when_localized,
+            )),
+            localization_gate,
         ])
     ]
 

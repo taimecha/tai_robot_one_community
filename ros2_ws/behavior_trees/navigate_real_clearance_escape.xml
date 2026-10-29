@@ -6,8 +6,8 @@
   Rank complete routes via checked forward starts before local escape.
   Advance only along a full checked route or to a checked turning/exit pocket.
   BackUp stays active continuously until an exit is available at the current pose.
-  After a route failure, clear stale dynamic obstacles once, wait for fresh
-  sensor costmaps, then retry before attempting a physical escape maneuver.
+  While a route stays blocked, clear stale dynamic obstacles at a bounded
+  interval, wait for fresh sensor costmaps, then retry the route.
   Never clear costmaps periodically while following a valid route.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
@@ -22,7 +22,7 @@
         <Sequence name="ClearAndReobserveDynamicObstacles">
           <PathFootprintClear data_only="true"/>
           <PathFootprintClear motion="motion_fault_free" goal="{goal}" controller_error="{follow_path_error_code}"/>
-          <BeginCostmapRefresh/>
+          <BeginCostmapRefresh cooldown="3.0" max_refreshes="12"/>
           <ClearEntireCostmap name="ClearGlobalDynamicObstacles" service_name="global_costmap/clear_entirely_global_costmap" server_timeout="2000"/>
           <ClearEntireCostmap name="ClearLocalDynamicObstacles" service_name="local_costmap/clear_entirely_local_costmap" server_timeout="2000"/>
           <WaitForRefreshedCostmaps timeout="3.0"/>
@@ -59,7 +59,7 @@
                   <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{forward_route_local_range}" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
                   <ReactiveSequence name="ExecuteRankedForwardRouteWithFreshCollisionChecks">
                     <PathFootprintClear motion="route_control_available" goal="{goal}"/>
-                    <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{forward_route_local_range}" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
+                    <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{forward_route_local_range}" execution_check_distance="1.2" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
                     <FollowPath path="{path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}"/>
                   </ReactiveSequence>
                 </ForwardRouteSearch>
@@ -187,7 +187,7 @@
       <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{route_local_range}" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
       <ReactiveSequence name="TryShortestThenLongerIfBlocked">
         <PathFootprintClear motion="route_control_available" goal="{goal}"/>
-        <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{route_local_range}" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
+        <PathFootprintClear path="{path}" goal="{goal}" planner_id="{path_planner}" prepared="true" local_check_distance="{route_local_range}" execution_check_distance="1.2" checked_path="{path}" path_planner="{path_planner}" blocked_near_robot="{local_escape_required}"/>
         <FollowPath path="{path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}"/>
       </ReactiveSequence>
     </RankedRouteSearch>

@@ -185,6 +185,46 @@ TEST_F(FootprintBTTest, AcceptsClearRouteWithFullForkFootprint)
   EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
 }
 
+TEST_F(FootprintBTTest, RunningRouteChecksNearbyBodyWithoutStoppingForDistantCell)
+{
+  robot_transform.translation.x = -1.2;
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (double x : {-1.2, -0.9, -0.6, -0.3, 0.0, 0.3, 0.65}) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.pose.position.x = x;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  board->set("path", path);
+  // This cell intersects only the last pose's fork, 1.85 m down the path.
+  map.data[80 * 160 + 137] = 254;
+  tree = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear path='{path}' prepared='true' execution_check_distance='1.2'/>"
+    "</BehaviorTree></root>", board);
+  connect();
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::SUCCESS);
+  auto full_route = factory.createTreeFromText(
+    "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
+    "<PathFootprintClear path='{path}' prepared='true'/></BehaviorTree></root>", board);
+  EXPECT_EQ(full_route.tickOnce(), BT::NodeStatus::FAILURE);
+
+  // The same cell must stop the controller once it enters the live horizon.
+  robot_transform.translation.x = -0.4;
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+
+  // And an obstacle next to the robot must always stop it immediately.
+  robot_transform.translation.x = -1.2;
+  map.data[80 * 160 + 137] = 0;
+  map.data[80 * 160 + 111] = 254;  // x=.7875, in the near fork sweep
+  publish();
+  rclcpp::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(tree.tickOnce(), BT::NodeStatus::FAILURE);
+}
+
 TEST_F(FootprintBTTest, GoalApproachJoinsAlignedCorridorAndExactDestination)
 {
   geometry_msgs::msg::PoseStamped goal, approach;
@@ -2785,14 +2825,15 @@ TEST_F(FootprintBTTest, RealRetreatSubtreeHaltsBackupOnlyWhenFullExitFits)
 {
   for (const auto & lib : {
     "compute_path_to_pose_action", "follow_path_action", "wait_action",
-    "back_up_action", "drive_on_heading", "spin_action", "pipeline_sequence",
+    "back_up_action", "drive_on_heading", "spin_action", "clear_costmap_service",
+    "pipeline_sequence",
     "rate_controller", "recovery_node", "goal_updated_condition",
     "globally_updated_goal_condition"})
   {
     factory.registerFromPlugin(std::string("/opt/ros/jazzy/lib/libnav2_") +
       lib + "_bt_node.so");
   }
-  for (const auto & name : {"BackUp", "Wait", "Spin"}) {
+  for (const auto & name : {"BackUp", "Wait", "Spin", "ClearEntireCostmap"}) {
     const auto manifest = factory.manifests().at(name);
     factory.unregisterBuilder(name);
     factory.registerBuilder(manifest,
@@ -2870,11 +2911,15 @@ TEST_F(FootprintBTTest, RealEscapeTreeLoadsWithInstalledNav2PortContracts)
   EXPECT_NO_THROW(factory.createTreeFromFile(REAL_ESCAPE_TREE, board));
 }
 
-TEST_F(FootprintBTTest, StaleCostmapRefreshCanRunOnceForEachGoal)
+TEST_F(FootprintBTTest, StaleCostmapRefreshRepeatsAfterCooldownWithinGoalLimit)
 {
   auto refresh = factory.createTreeFromText(
     "<root BTCPP_format='4'><BehaviorTree ID='Main'>"
-    "<BeginCostmapRefresh/></BehaviorTree></root>", board);
+    "<BeginCostmapRefresh cooldown='0.1' max_refreshes='2'/>"
+    "</BehaviorTree></root>", board);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::SUCCESS);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::RUNNING);
+  rclcpp::sleep_for(std::chrono::milliseconds(120));
   EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::SUCCESS);
   EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::FAILURE);
 
@@ -2884,7 +2929,7 @@ TEST_F(FootprintBTTest, StaleCostmapRefreshCanRunOnceForEachGoal)
     "</BehaviorTree></root>", board);
   EXPECT_EQ(reset.tickOnce(), BT::NodeStatus::SUCCESS);
   EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::SUCCESS);
-  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::FAILURE);
+  EXPECT_EQ(refresh.tickOnce(), BT::NodeStatus::RUNNING);
 }
 
 TEST_F(FootprintBTTest, ClearedCostmapRetryWaitsForBothNewMaps)
