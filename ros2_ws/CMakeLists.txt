@@ -55,6 +55,15 @@ if(nav2_smac_planner_FOUND AND nav2_core_FOUND)
   endif()
 endif()
 
+include(CTest)
+if(BUILD_TESTING AND nav2_core_FOUND)
+  add_executable(test_straight_goal_path test/test_straight_goal_path.cpp)
+  target_include_directories(test_straight_goal_path PRIVATE include)
+  ament_target_dependencies(test_straight_goal_path
+    nav2_core nav2_costmap_2d nav_msgs geometry_msgs tf2_geometry_msgs tf2_ros)
+  add_test(NAME straight_goal_path COMMAND test_straight_goal_path)
+endif()
+
 # Fast DDS is the validated middleware for the current WSL mirrored-network
 # setup and the Raspberry Pi deployment. Install a workspace environment hook
 # so every terminal that sources install/setup.bash selects the same RMW.

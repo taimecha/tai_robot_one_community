@@ -187,6 +187,11 @@ inline void appendExactGoal(
   }
   auto exact = goal;
   exact.header = path.header;
+  // ControllerServer transforms this pose using its own stamp on every
+  // goal check. Use the latest map->odom, as the controller does while
+  // following the map-frame path; a planning-time stamp freezes an old A
+  // in odom after AMCL corrections. Map XY/yaw remain exactly as requested.
+  exact.header.stamp = builtin_interfaces::msg::Time{};
   if (distance < 1e-9) {path.poses.back() = exact;} else {path.poses.push_back(exact);}
 }
 }  // namespace tai_robot_one

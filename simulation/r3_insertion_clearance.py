@@ -1,4 +1,4 @@
-"""Geometric clearance for the real C-to-B insertion, in the pallet frame."""
+"""Geometric clearance for the real pickup, in the pallet frame."""
 import math
 
 from r3_core import collision, compose, fork_for_base, inverse
@@ -62,3 +62,89 @@ def insertion_clearance(base, target, geometry, *, project_to_b=True):
                 fork_root_lateral_m=fork[1], heading_error_deg=math.degrees(yaw),
                 gap_m=-fork[0], project_to_b=project_to_b,
                 physical_clearance_independently_verified=False)
+
+
+def braking_trajectory(base, speed, omega, acceleration, angular_acceleration, latency_s):
+    """Yield (pose, time) while holding for latency, then braking each axis.
+
+    Angular velocity reaches zero on its own schedule; a slow linear stop
+    must not stretch a short gyro observation into a long constant-curvature
+    turn. Break integration at the command delay and both zero crossings.
+    Midpoint twists keep spatial steps <= 2 mm and angular steps <= 0.1 deg.
+    """
+    pose = tuple(base)
+    yield pose, 0.
+    if speed == 0. and omega == 0.:
+        return
+    linear_stop_s = speed/acceleration
+    angular_stop_s = abs(omega)/angular_acceleration
+    t = 0.
+    for boundary in sorted({latency_s, latency_s+linear_stop_s,
+                            latency_s+angular_stop_s}):
+        while boundary-t > 1e-10:
+            elapsed = max(0., t-latency_s)
+            v = max(0., speed-acceleration*elapsed)
+            w = max(0., abs(omega)-angular_acceleration*elapsed)
+            dt = min(.05, boundary-t, .002/max(v, 1e-9),
+                     math.radians(.1)/max(w, 1e-9))
+            middle = max(0., t+dt/2-latency_s)
+            v = max(0., speed-acceleration*middle)
+            w = math.copysign(max(0., abs(omega)-angular_acceleration*middle), omega)
+            angle = w*dt
+            travel = ((v*dt, 0., angle) if abs(w) < 1e-9 else
+                      (v/w*math.sin(angle), v/w*(1-math.cos(angle)), angle))
+            pose = compose(pose, travel)
+            t += dt
+            yield pose, t
+
+
+def insertion_motion_clearance(base, target, geometry, speed, omega, *, latency_s):
+    """Check the commanded arc and its braking sweep against finite obstacles.
+
+    A constant-heading projection all the way to B is not the motion of the
+    heading controller. In particular, it must not veto its first correction
+    while the forks are still outside the pallet. Instead, reserve command
+    latency and a complete stop with separate linear/angular braking. Inflate all four
+    legs by the same 10 mm margin used for static insertion checks. This also
+    checks the body, deck, floor and rear clearance through ``collision``.
+    """
+    acceleration = geometry['acceleration']
+    angular_acceleration = geometry['angular_acceleration']
+    if (not all(math.isfinite(v) for v in (*base, *target, speed, omega, latency_s,
+                                          acceleration, angular_acceleration))
+            or speed < 0 or latency_s < 0
+            or acceleration <= 0 or angular_acceleration <= 0):
+        raise ValueError('invalid insertion motion prediction')
+    linear_brake_s = speed/acceleration
+    angular_brake_s = abs(omega)/angular_acceleration
+    distance = speed*latency_s + speed*linear_brake_s/2
+    angle = omega*latency_s + omega*angular_brake_s/2
+    padded = dict(geometry, leg_size=geometry['leg_size']+2*MIN_INSERTION_CLEARANCE_M)
+    hit = None
+    intersection = None
+    checked = 0
+    for pose, elapsed in braking_trajectory(base, speed, omega, acceleration,
+                                           angular_acceleration, latency_s):
+        hit = collision(pose, target, padded)
+        checked += 1
+        if hit:
+            intersection = dict(time_s=elapsed, base_pose_xyyaw=list(pose), obstacle=hit)
+            break
+    # Retain the familiar lateral diagnostics, but distinguish the infinitely
+    # long corridor from the finite obstacle envelope actually enforced here.
+    report = insertion_clearance(base, target, geometry, project_to_b=False)
+    report['current_corridor_ready'] = report['ready']
+    report['current_corridor_reason'] = report['reason']
+    report.update(ready=hit is None,
+        reason=(f'command/braking sweep intersects {hit} '
+                f'with {MIN_INSERTION_CLEARANCE_M*1000:.1f} mm margin' if hit else
+                'command and braking sweep clear of pallet obstacles'),
+        validation_scope='finite_pallet_obstacles_command_and_braking_sweep',
+        braking_model='independent_linear_and_angular_deceleration',
+        command_speed_mps=speed, command_omega_rps=omega,
+        command_latency_s=latency_s,
+        braking_time_s=max(linear_brake_s, angular_brake_s),
+        linear_braking_time_s=linear_brake_s, angular_braking_time_s=angular_brake_s,
+        stopping_distance_m=distance, stopping_yaw_rad=angle,
+        first_intersection=intersection, checked_poses=checked)
+    return report

@@ -189,11 +189,13 @@ class TrialEnableClient(Node):
     def __init__(self):
         super().__init__('r3_enable_trial')
         self.status=None;self.odom=None;self.odom_stamps=[]
+        self.control_status=None
         self.service=self.create_client(Trigger,'/pallet/r3/localization/enable_trial')
         qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String,'/pallet/r3/localization/status',self.on_status,qos)
         self.create_subscription(Odometry,'/pallet/r3/localized_odom',self.on_odom,qos_profile_sensor_data)
+        self.create_subscription(String,'/pallet/r3/control_odom/status',self.on_control_status,qos)
 
     def now(self):return self.get_clock().now().nanoseconds*1e-9
 
@@ -208,6 +210,13 @@ class TrialEnableClient(Node):
                 and (not self.odom_stamps or value>self.odom_stamps[-1])):
             self.odom_stamps.append(value)
             self.odom_stamps=self.odom_stamps[-20:]
+
+    def on_control_status(self,msg):
+        try:
+            value=json.loads(msg.data)
+            if isinstance(value,dict):self.control_status=value
+        except (ValueError,TypeError):
+            pass
 
     def velocity_publishers(self):
         owners={}
@@ -263,6 +272,12 @@ def enable_trial(node,map_file,timeout,*,clock=time.monotonic,ok=rclpy.ok):
             node.role_change_acknowledged=True
             issue='waiting for fresh bounded trial localization status and odometry'
         try:
+            health=getattr(node,'control_status',None)
+            if (isinstance(node.status,dict) and node.status.get('external_control_odom') is True
+                    and isinstance(health,dict)
+                    and fresh(health.get('published_ros_s'),now,.5)
+                    and health.get('integrity_fault')):
+                raise RuntimeError('control odometry rejected handoff: '+str(health['integrity_fault']))
             result=validate_handoff(initial,node.status,node.odom,now,map_file)
             # Confirm a stream from the enabled role, not one queued sample.
             enabled=result['trial_handoff']['at_ros_s']
@@ -273,8 +288,13 @@ def enable_trial(node,map_file,timeout,*,clock=time.monotonic,ok=rclpy.ok):
             result['confirmed_odom_span_s']=samples[-1]-samples[0]
             result['role_change_service_calls']=attempts
             result['role_change_acknowledged']=True
+            result['control_odometry_status']=copy.deepcopy(health)
             return result
-        except ValueError as exc:issue=str(exc)
+        except ValueError as exc:
+            issue=str(exc)
+            health=getattr(node,'control_status',None)
+            if 'fresh bounded trial odometry' in issue and isinstance(health,dict):
+                issue+='; control_odom: '+str(health.get('reason','unknown'))
     raise RuntimeError('localization role-change timeout/stopped: '+issue)
 
 
@@ -299,7 +319,9 @@ def main():
         result=dict(status='BLOCKED',reason=str(exc) or 'localization role change interrupted',actuator_commands=0,
                     navigation_goals_sent=0,transform_publications=0,
                     role_change_service_calls=getattr(node,'role_change_service_calls',0),
-                    role_change_acknowledged=getattr(node,'role_change_acknowledged',False))
+                    role_change_acknowledged=getattr(node,'role_change_acknowledged',False),
+                    control_odometry_status=copy.deepcopy(node.control_status),
+                    localization_role=(node.status or {}).get('role'))
     finally:
         if result is not None:
             atomic_json(args.output,result)

@@ -1,0 +1,263 @@
+{
+  "recorded_run": "20261117_184021_y6884h",
+  "source_localization_ready": {
+    "run_id": "7d797348-addf-4f49-8334-ba9337e72c4a",
+    "ready": true,
+    "reason": "fresh paired AMCL posterior checked by live LiDAR and EKF odom",
+    "frame_id": "r3_trial",
+    "published_ros_s": 1794915672.689683,
+    "map_file": "/home/admin/tai_robot_one/robot_amr/ros2_ws/maps/tai_map_real_edited.yaml",
+    "correction_xyyaw": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "raw_correction_xyyaw": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "baseline_map_odom": [
+      3.456477345037869,
+      1.7097337141529274,
+      -1.764238498498164
+    ],
+    "amcl_stamp_s": 1794915672.5003655,
+    "xy_std_m": 0.014129833125208838,
+    "yaw_std_deg": 0.2700294173836463,
+    "covariance_limits": {
+      "xy_std_m": 0.1,
+      "yaw_std_deg": 5.0
+    },
+    "covariance_model": "EKF rotated plus AMCL diagonal bound",
+    "correction_pending_translation_m": 0.0,
+    "correction_pending_yaw_deg": 0.0,
+    "correction_settled": true,
+    "correction_limits": {
+      "translation_m": 0.2,
+      "yaw_deg": 5.0,
+      "translation_rate_mps": 0.03,
+      "yaw_rate_degps": 0.5
+    },
+    "physical_alignment_verified": false,
+    "covariance_is_accuracy_proof": false,
+    "scan_map_fit": {
+      "ready": true,
+      "reason": "scan/map endpoint fit accepted; global uniqueness is not established",
+      "valid_endpoints": 941,
+      "sampled_endpoints": 720,
+      "inlier_endpoints": 636,
+      "inlier_ratio": 0.8833333333333333,
+      "median_distance_m": 0.003728002419941312,
+      "inlier_distance_m": 0.15,
+      "min_inlier_ratio": 0.65,
+      "max_median_distance_m": 0.12,
+      "distance_field": "point-to-occupied-cell-area distance with bounded nearest-source candidates",
+      "uniqueness_verified": false,
+      "scan_stamp_s": 1794915672.5003655
+    },
+    "stationary_cache": {
+      "enabled": true,
+      "validated": false,
+      "reason": "waiting for distinct matching scans spanning one second",
+      "original_amcl_stamp_s": 1794915672.5003655,
+      "amcl_observation_age_s": 0.1893174648284912,
+      "original_covariance_preserved": true,
+      "repeated_nomotion_updates": false,
+      "nomotion_request_count": 1,
+      "interfaces_matched_since_wall_s": 10096.999166336
+    },
+    "stationary_snapshot": {
+      "run_id": "7d797348-addf-4f49-8334-ba9337e72c4a",
+      "map_file": "/home/admin/tai_robot_one/robot_amr/ros2_ws/maps/tai_map_real_edited.yaml",
+      "occupancy_map_signature": "a2dbee788d48ec52369f4ca15aa4ee5653f89d859bab4572a2c4beeaf3f74383",
+      "amcl_stamp_s": 1794915672.5003655,
+      "map_pose_xyyaw": [
+        3.4564773439827494,
+        1.7097337087667186,
+        -1.7642428906843246
+      ],
+      "covariance_6x6": [
+        0.00019965218414624895,
+        8.482545736375857e-06,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        8.482545736375857e-06,
+        0.00012047052318088234,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.221144913171336e-05
+      ],
+      "odom_anchor_xyyaw": [
+        5.488581055154209e-09,
+        -5.8113771651765635e-15,
+        -4.392186160519816e-06
+      ],
+      "map_odom_xyyaw": [
+        3.456477345037869,
+        1.7097337141529274,
+        -1.764238498498164
+      ],
+      "cloud_stamp_s": 1794915672.6521387,
+      "particle_pairing": {
+        "method": "bounded_timestamps",
+        "pose_stamp_s": 1794915672.5003655,
+        "cloud_stamp_s": 1794915672.6521387,
+        "cloud_pose_lag_s": 0.15177321434020996,
+        "validated_ros_s": 1794915672.689683,
+        "timestamps_fresh_at_pairing": true,
+        "full_cloud_state_verified": false,
+        "physical_accuracy_verified": false
+      },
+      "particle_metrics": {
+        "particle_count": 501,
+        "xy_std_m": 0.014129833118905193,
+        "xy_rms_m": 0.017891973259441304,
+        "unique_pose_bins": 58,
+        "largest_pose_bin_mass": 0.23153692614770433,
+        "pose_bin_resolution": {
+          "xy_m": 0.001,
+          "yaw_deg": 0.1
+        },
+        "yaw_std_deg": 0.2700294173863457,
+        "dominant_mass": 1.0000000000000002,
+        "weighted_mean_xyyaw": [
+          3.4564773439827983,
+          1.7097337087667392,
+          -1.7642428906843246
+        ],
+        "converged": true
+      }
+    },
+    "pending_observation_issue": "",
+    "localization_fault": null,
+    "map_update_event": null,
+    "navigation_recovery": {
+      "hold_commands": false
+    },
+    "refresh_conditions": {
+      "sensors_fresh": true,
+      "history_tf_ready": true,
+      "scan_tf_ready": true,
+      "parked_duration_s": 2.586207602000286,
+      "interfaces_ready": true,
+      "service_ready": true,
+      "stationary": true,
+      "refresh_armed": false
+    },
+    "lifecycle_services": {
+      "amcl": {
+        "id": 3,
+        "stamp": 10097.903379675,
+        "request_pending": false,
+        "request_age_s": null,
+        "request_timeouts": 0,
+        "client_recreations": 0
+      }
+    },
+    "amcl_pipeline": {
+      "latest_received_pose_stamp_s": 1794915672.5003655,
+      "latest_pose_received_at_ros_s": 1794915672.657494,
+      "latest_accepted_pose_stamp_s": 1794915672.5003655,
+      "latest_cloud_stamp_s": 1794915672.6521387,
+      "pending_pose_count": 0,
+      "pending_reason": ""
+    },
+    "stationary_inspection": false,
+    "continuous_localization": true,
+    "navigation_monitor": true,
+    "external_control_odom": true,
+    "control_status_topic": "/pallet/r3/control_odom/status",
+    "ekf_freshness_owner": "r3_amcl_trial_bridge",
+    "supervisor_ekf_capture_age_s": 0.07522320747375488,
+    "processing_times_s": {
+      "particle_observation_s": 0.00835418499991647,
+      "scan_fit_s": 0.010089604000313557
+    },
+    "role": "navigation_monitor",
+    "trial_handoff": null,
+    "trial_handoff_at_ros_s": null,
+    "robot_stationary": true,
+    "live_observation_validated": true,
+    "moving_live_validated": false,
+    "motion_prediction_validated": false,
+    "motion_prediction": null,
+    "current_map_odom_xyyaw": [
+      3.456477345037869,
+      1.7097337141529274,
+      -1.764238498498164
+    ],
+    "current_map_pose_xyyaw": [
+      3.4564773439827494,
+      1.7097337087667186,
+      -1.764245038524434
+    ],
+    "stationary_refresh_armed": false,
+    "global_localization": {
+      "enabled": true,
+      "requested": true,
+      "service_completed": true,
+      "requested_ros_s": 1794915669.7812538,
+      "particle_gate_ready": false,
+      "particle_gate_reason": "waiting for >=3 unambiguous particle clouds spanning >=1 second",
+      "particle_metrics": {
+        "particle_count": 501,
+        "xy_std_m": 0.014129833118905193,
+        "xy_rms_m": 0.017891973259441304,
+        "unique_pose_bins": 58,
+        "largest_pose_bin_mass": 0.23153692614770433,
+        "pose_bin_resolution": {
+          "xy_m": 0.001,
+          "yaw_deg": 0.1
+        },
+        "yaw_std_deg": 0.2700294173863457,
+        "dominant_mass": 1.0000000000000002,
+        "weighted_mean_xyyaw": [
+          3.4564773439827983,
+          1.7097337087667392,
+          -1.7642428906843246
+        ],
+        "converged": true
+      },
+      "latest_cloud_stamp_s": 1794915672.6521387,
+      "autonomous_motion_for_localization": false
+    }
+  },
+  "recorded_failure": {
+    "status": "BLOCKED",
+    "reason": "localization role-change timeout/stopped: fresh bounded trial odometry is not available",
+    "actuator_commands": 0,
+    "navigation_goals_sent": 0,
+    "transform_publications": 0,
+    "role_change_service_calls": 1,
+    "role_change_acknowledged": true
+  },
+  "test_note": "Tests build explicit synthetic role transitions from this recorded posterior. Original failure did not persist control-odom health, so the precise raw input event is not known."
+}

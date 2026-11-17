@@ -30,7 +30,8 @@ from pallet_preview import draw_detections
 from pallet_acquisition import AcquisitionSession, valid_target
 from pallet_goal_gate import RecognitionGoalGate
 from pallet_rgbd_health import RGBDHealth
-from pallet_detection_selection import unique_pallet_indices, PALLET_CLASSES
+from pallet_detection_selection import (unique_pallet_indices, PALLET_CLASSES,
+                                        MIN_PALLET_CONFIDENCE)
 
 
 class DetectionNode(Node):
@@ -56,6 +57,7 @@ class DetectionNode(Node):
         self.published_seeds = 0
         self.last_issue = ''
         self.last_issue_log_wall = 0.
+        self.pallet_candidates = []
         self.rgb_received = 0
         self.rgb_received_wall = None
         self.rgbd_health = RGBDHealth()
@@ -117,7 +119,9 @@ class DetectionNode(Node):
                          input_age_ms=self.input_age_ms, result_age_ms=self.result_age_ms,
                          model_ms=self.model_ms, seed_pack_ms=self.seed_pack_ms,
                          seed_publish_ms=self.seed_publish_ms, published_seeds=self.published_seeds,
-                         last_issue=self.last_issue)
+                         last_issue=self.last_issue,
+                         min_pallet_confidence=MIN_PALLET_CONFIDENCE,
+                         pallet_candidates=list(self.pallet_candidates))
             state['rgb_tracker_acknowledged'] = self.tracker_ready(ros)
             state['rgb_tracker'] = self.tracking_status
             state['rgbd_health'] = self.rgbd_health.snapshot(
@@ -236,6 +240,7 @@ class DetectionNode(Node):
         self.pending_images['rgb'].clear()
         self.inference_attempts = 0
         self.last_issue = ''
+        self.pallet_candidates = []
         self.published_seeds = 0
         self.seed_publish_ms = None
         self.rgbd_health.reset()
@@ -450,7 +455,14 @@ class DetectionNode(Node):
         classes = result.boxes.cls.cpu().numpy()
         confidence = result.boxes.conf.cpu().numpy()
         indices = unique_pallet_indices(boxes, classes, confidence, result.names)
-        detection.status = f'expected one pallet, found {len(indices)}'
+        with self.lock:
+            self.pallet_candidates = [dict(class_name=result.names[int(cls)],
+                confidence=float(confidence[i]), bbox_xyxy=boxes[i].astype(float).tolist(),
+                eligible=i in indices) for i, cls in enumerate(classes)
+                if result.names[int(cls)].strip().lower() in PALLET_CLASSES
+                and np.isfinite(confidence[i]) and np.isfinite(boxes[i]).all()]
+        detection.status = (f'expected one pallet with confidence >= {MIN_PALLET_CONFIDENCE:.2f}, '
+                            f'found {len(indices)}')
         if len(indices) == 1 and result.masks is not None:
             index = indices[0]
             mask = result.masks.data[index].cpu().numpy().astype(np.uint8)
@@ -556,10 +568,13 @@ def main():
     spin_stop = threading.Event()
     def spin():
         try:
-            while not spin_stop.is_set():
+            while not spin_stop.is_set() and rclpy.ok():
                 executor.spin_once(timeout_sec=.1)
         except ExternalShutdownException:
             pass
+        except RuntimeError:
+            if rclpy.ok():
+                raise
     thread = threading.Thread(target=spin, daemon=True)
     thread.start()
     next_at = 0.0

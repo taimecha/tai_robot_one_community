@@ -2,6 +2,8 @@
 from collections import deque
 import math
 
+from pallet_detection_selection import MIN_PALLET_CONFIDENCE, PALLET_CLASSES
+
 
 def valid_target(msg, now_s):
     values = (msg.camera_forward_m, msg.chassis_front_forward_m, msg.opening_lateral_m,
@@ -62,7 +64,7 @@ class AcquisitionSession:
             return
         self.last_detection = stamp
         if (not valid or not -.05 <= ros-stamp <= self.seed_age_s or not math.isfinite(confidence)
-                or confidence < .75 or label not in ('pallets', 'emty pallet')
+                or not MIN_PALLET_CONFIDENCE <= confidence <= 1. or label not in PALLET_CLASSES
                 or len(bbox) != 4 or not all(math.isfinite(v) for v in bbox)
                 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
             self.detections.clear()

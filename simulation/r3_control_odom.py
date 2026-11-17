@@ -156,6 +156,12 @@ class ControlOdomGuard:
         """Keep control on fresh EKF; adopt only validated AMCL updates."""
         self.raw_valid=False
         if self.fault:raise ValueError(self.fault)
+        if self.reference_state is None and (not isinstance(status,dict) or status.get('role')!='trial'):
+            # This node starts before Nav2. Navigation/startup captures are
+            # not the continuity epoch of a controller that has no frame yet.
+            self.mode='waiting_for_trial_handoff'
+            self.update_issue='control odom is disabled until the trial handoff'
+            raise IgnoredOdomSample(self.update_issue)
         if message.header.frame_id!='odom' or message.child_frame_id not in ('base_footprint','base_link'):
             raise ValueError('invalid EKF frame for control odom')
         stamp=message.header.stamp.sec+message.header.stamp.nanosec*1e-9
@@ -168,7 +174,7 @@ class ControlOdomGuard:
                 or abs(sum(v*v for v in values[2:])-1.)>.02):
             raise ValueError('invalid EKF pose/twist for control odometry')
         raw=(p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
-        if self.raw_stamp is not None:
+        if self.raw_stamp is not None and self.reference_state is not None:
             if stamp<self.raw_stamp:
                 self.fault='EKF capture clock reversed; restart control odometry'
             elif stamp-self.raw_stamp>.5:
@@ -365,7 +371,7 @@ class ControlOdomGuard:
 
 
 class ControlOdomNode(Node):
-    def __init__(self,map_file,*,context=None):
+    def __init__(self,map_file,*,context=None,diagnostics_path=None):
         super().__init__('r3_control_odom',context=context)
         self.guard=ControlOdomGuard(map_file)
         self.control_stream_id=str(uuid.uuid4())
@@ -376,6 +382,18 @@ class ControlOdomNode(Node):
         self.last_output_wall=None
         self.maximum_output_gap_s=0.
         self.insertion_lock_issue=''
+        self.raw_input_samples=0
+        self.latest_input_capture=None
+        self.latest_input_receive=None
+        self.last_warning_wall=0.
+        self.last_warning_reason=None
+        self.diagnostics=None
+        self.last_diagnostic_wall=0.
+        self.last_diagnostic_key=None
+        if diagnostics_path is not None:
+            diagnostics_path=Path(diagnostics_path)
+            diagnostics_path.parent.mkdir(parents=True,exist_ok=True)
+            self.diagnostics=diagnostics_path.open('w')
         self.output=self.create_publisher(Odometry,'/pallet/r3/localized_odom',qos_profile_sensor_data)
         reliable=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,
                            reliability=ReliabilityPolicy.RELIABLE)
@@ -405,6 +423,9 @@ class ControlOdomNode(Node):
 
     def on_odom(self,message):
         now=self.get_clock().now().nanoseconds*1e-9
+        self.raw_input_samples+=1
+        self.latest_input_capture=message.header.stamp.sec+message.header.stamp.nanosec*1e-9
+        self.latest_input_receive=now
         previously_valid=self.guard.raw_valid
         try:
             output=self.guard.transform(self.state or {},message,now)
@@ -415,6 +436,12 @@ class ControlOdomNode(Node):
             return
         except (ValueError,TypeError,KeyError) as exc:
             self.reason=str(exc)
+            wall=time.monotonic()
+            if (self.state and self.state.get('role')=='trial'
+                    and self.reason!=self.last_warning_reason
+                    and (self.guard.fault or wall-self.last_warning_wall>=2.)):
+                self.get_logger().warn('Control odometry withheld: '+self.reason)
+                self.last_warning_reason,self.last_warning_wall=self.reason,wall
             return
         wall=time.monotonic()
         if self.last_output_wall is not None:
@@ -442,6 +469,9 @@ class ControlOdomNode(Node):
             supervisor_validation_age_s=(now-self.state['published_ros_s']
                 if isinstance(self.state,dict) and number(self.state.get('published_ros_s')) else None),
             maximum_output_gap_s=self.maximum_output_gap_s,original_capture_stamp_preserved=True,
+            raw_input_samples=self.raw_input_samples,
+            latest_input_capture_stamp_s=self.latest_input_capture,
+            latest_input_received_ros_s=self.latest_input_receive,
             control_status_topic='/pallet/r3/control_odom/status',control_mode=self.guard.mode,
             amcl_update_issue=self.guard.update_issue,amcl_update_validated=self.guard.mode=='amcl_corrected_ekf',
             insertion_lock=self.guard.insertion_lock,insertion_lock_issue=self.insertion_lock_issue,
@@ -463,16 +493,30 @@ class ControlOdomNode(Node):
             state['correction_pending_yaw_deg']=angle
             state['correction_settled']=distance<=.005 and angle<=.2
         self.health.publish(String(data=json.dumps(state,allow_nan=False)))
+        if self.diagnostics is not None:
+            wall=time.monotonic()
+            key=(ready,state['reason'],state['integrity_fault'],state['control_mode'])
+            if key!=self.last_diagnostic_key or wall-self.last_diagnostic_wall>=.5:
+                self.diagnostics.write(json.dumps(state,allow_nan=False)+'\n')
+                self.diagnostics.flush()
+                self.last_diagnostic_key,self.last_diagnostic_wall=key,wall
+
+    def destroy_node(self):
+        if self.diagnostics is not None:
+            self.diagnostics.close()
+            self.diagnostics=None
+        return super().destroy_node()
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--map',type=Path,required=True)
+    parser.add_argument('--diagnostics',type=Path)
     args=parser.parse_args()
     if not args.map.is_absolute() or not args.map.is_file():
         parser.error('--map must name the selected existing absolute map YAML')
     rclpy.init()
-    node=ControlOdomNode(args.map)
+    node=ControlOdomNode(args.map,diagnostics_path=args.diagnostics)
     try:rclpy.spin(node)
     except (KeyboardInterrupt,ExternalShutdownException):pass
     finally:

@@ -16,7 +16,7 @@ import time
 import cv2
 import numpy as np
 import rclpy
-from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
@@ -31,6 +31,7 @@ from pallet_perception_config import parse_args
 from pallet_rgbd_estimator import RGBDTargetEstimator
 from pallet_messages import empty_message
 from pallet_measurement_evidence import MeasurementEvidenceRecorder
+from pallet_detection_selection import MIN_PALLET_CONFIDENCE
 
 
 class TargetNode(CameraReceiver):
@@ -126,7 +127,7 @@ class TargetNode(CameraReceiver):
         elapsed = (time.monotonic()-started)*1000
         self.processing_diagnostics['registration_ms'] = elapsed
         if elapsed > 200:
-            self.get_logger().warn(f'Camera source check occupied receiver for {elapsed:.0f} ms')
+            self.get_logger().warn(f'Camera source check took {elapsed:.0f} ms on its separate callback group')
 
     def on_seed(self, msg):
         if msg.valid and stamp_ns(msg) > max(self.last_seed_stamp_ns, self.recognition_start_ns):
@@ -151,7 +152,8 @@ class TargetNode(CameraReceiver):
         mask = cv2.imdecode(np.frombuffer(msg.mask.data, np.uint8), cv2.IMREAD_GRAYSCALE)
         if (mask is None or mask.shape != SHAPE or msg.mask.format != 'png'
                 or msg.class_name.strip().lower() not in ('pallets', 'emty pallet')
-                or not np.isfinite(msg.bbox_xyxy).all() or not 0 <= msg.confidence <= 1):
+                or not np.isfinite(msg.bbox_xyxy).all()
+                or not MIN_PALLET_CONFIDENCE <= msg.confidence <= 1):
             return None
         image = decode_image(msg.rgb)
         if image.shape[:2] != SHAPE:
@@ -340,15 +342,18 @@ def main():
     rclpy.init()
     node = TargetNode(args)
     estimator = RGBDTargetEstimator(args)
-    executor = SingleThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     spin_stop = threading.Event()
     def spin():
         try:
-            while not spin_stop.is_set():
+            while not spin_stop.is_set() and rclpy.ok():
                 executor.spin_once(timeout_sec=.1)
         except ExternalShutdownException:
             pass
+        except RuntimeError:
+            if rclpy.ok():
+                raise  # Preserve real executor failures; ignore only shutdown races.
     thread = threading.Thread(target=spin, daemon=True)
     thread.start()
     last_pair, last_invalid, last_log = time.monotonic(), 0.0, 0.0

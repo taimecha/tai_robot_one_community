@@ -110,6 +110,8 @@ done
 mkdir -p simulation/output/r3_live
 exec 9>simulation/output/r3_live/.trial.lock
 flock -n 9 || { echo 'Đã có một lượt r3 đang chạy' >&2; exit 1; }
+# Keep the session lock in this owner shell only. A surviving camera/ROS or
+# foreground Python/tee process must not retain fd 9 after the owner exits.
 run_dir=$(mktemp -d "$root/simulation/output/r3_live/$(date +%Y%m%d_%H%M%S)_XXXXXX")
 plan="$run_dir/plan/frozen_plan.json"
 camera_pid=''
@@ -161,7 +163,7 @@ start_perception() {
     return 0
   fi
   echo 'Nạp sẵn model YOLO; nhận diện và tracking đang tạm dừng tới khi xe ở A.'
-  setsid bash camera/detect_astra/scripts/open_pallet_target.sh \
+  setsid 9>&- bash camera/detect_astra/scripts/open_pallet_target.sh \
     --model camera/detect_astra/data/runtime_models/best_v3_ncnn_model \
     --measurement-bias-yaml camera/detect_astra/config/calibration/pallet_target_bias_robot_2026_11_11.yaml \
     --measurement-evidence-dir "$run_dir/camera_evidence" \
@@ -174,13 +176,13 @@ start_navigation() {
   local attempt
   for attempt in 1 2 3; do
     echo "Khởi động Nav2 (lần $attempt/3); chưa gửi goal chuyển động."
-    setsid ros2 launch camera/detect_astra/launch/r3_navigation.launch.py \
+    setsid 9>&- ros2 launch camera/detect_astra/launch/r3_navigation.launch.py \
       >"$run_dir/navigation.log" 2>&1 &
     navigation_pid=$!
-    if python3 simulation/r3_wait_localization_active.py --timeout 60 \
+    if python3 9>&- simulation/r3_wait_localization_active.py --timeout 60 \
         --nodes controller_server planner_server behavior_server velocity_smoother collision_monitor bt_navigator \
         --startup-log "$run_dir/navigation.log" \
-        2>&1 | tee -a "$run_dir/navigation_activation.log"; then
+        2>&1 | tee 9>&- -a "$run_dir/navigation_activation.log"; then
       return 0
     fi
     stop_owned "$navigation_pid"
@@ -217,7 +219,7 @@ wait_for_localization() {
 
 localization_nodes_running() {
   local nodes
-  if ! nodes=$(ros2 node list --no-daemon); then
+  if ! nodes=$(ros2 9>&- node list --no-daemon); then
     echo 'Không kiểm tra được ROS graph; dừng để tránh mở trùng AMCL/map_server.' >&2
     return 2
   fi
@@ -228,7 +230,7 @@ cleanup() {
   local result=$?
   trap - EXIT
   if [[ $pickup -eq 1 && -n "$bringup_pid" ]]; then
-    python3 simulation/r3_lift_control.py stop --execute >"$run_dir/lift_stop.log" 2>&1 || true
+    python3 9>&- simulation/r3_lift_control.py stop --execute >"$run_dir/lift_stop.log" 2>&1 || true
   fi
   stop_owned "$global_initializer_pid"
   stop_owned "$safety_pid"
@@ -251,7 +253,7 @@ cleanup() {
   fi
   if [[ -f "$plan" && -s "$run_dir/trial/executed_odom_base.csv" &&
         -f "$run_dir/trial/mission_result.json" ]]; then
-    if camera/detect_astra/.venv/bin/python simulation/r3_render_real_result.py \
+    if camera/detect_astra/.venv/bin/python 9>&- simulation/r3_render_real_result.py \
        --plan "$plan" --trial "$run_dir/trial" \
        --output "$run_dir/trajectory_result.png" --view laptop; then
       echo "Ảnh ba quỹ đạo: $run_dir/trajectory_result.png"
@@ -272,7 +274,7 @@ if [[ $localization_only -eq 1 || $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; t
   session_mode=stationary_inspection
   if [[ $nav_to_a -eq 1 ]]; then session_mode=navigation_to_A; fi
   if [[ $recognize_here -eq 1 ]]; then session_mode=recognition_here; fi
-  python3 - "$run_dir" "$map_file" "$$" "$session_mode" <<'PY'
+  python3 9>&- - "$run_dir" "$map_file" "$$" "$session_mode" <<'PY'
 import json,sys
 from pathlib import Path
 run,map_file,pid,mode=sys.argv[1:]
@@ -305,18 +307,18 @@ fi
 
 if pgrep -f 'astra_camera_node( |$)' >/dev/null; then
   echo 'Dùng lại camera Astra đang chạy.'
-  ros2 param get /camera/camera depth_registration | grep -E 'True$' >/dev/null || {
+  ros2 9>&- param get /camera/camera depth_registration | grep 9>&- -E 'True$' >/dev/null || {
     echo 'Camera đang chạy nhưng depth_registration chưa bật.' >&2; exit 1;
   }
 else
   echo 'Mở camera Astra...'
-  ASTRA_POINT_CLOUD=false setsid bash camera/detect_astra/scripts/open_registered_astra.sh \
+  ASTRA_POINT_CLOUD=false setsid 9>&- bash camera/detect_astra/scripts/open_registered_astra.sh \
     >"$run_dir/camera.log" 2>&1 &
   camera_pid=$!
 fi
 
 echo 'Mở phần cứng, odom và LiDAR dừng vật cản...'
-setsid ros2 launch camera/detect_astra/launch/r3_real_bringup.launch.py \
+setsid 9>&- ros2 launch camera/detect_astra/launch/r3_real_bringup.launch.py \
   >"$run_dir/bringup.log" 2>&1 &
 bringup_pid=$!
 if [[ $localization == amcl ]]; then
@@ -327,14 +329,14 @@ if [[ $localization == amcl ]]; then
   precision_profile=$inspection_profile
   [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]] || precision_profile=true
   for localization_attempt in 1 2; do
-    setsid ros2 launch camera/detect_astra/launch/r3_localization.launch.py map_file:="$map_file" \
+    setsid 9>&- ros2 launch camera/detect_astra/launch/r3_localization.launch.py map_file:="$map_file" \
       stationary_inspection:="$inspection_profile" \
       precision_localization:="$precision_profile" \
       >"$run_dir/localization.log" 2>&1 &
     localization_pid=$!
-    if python3 simulation/r3_wait_localization_active.py --timeout 30 \
+    if python3 9>&- simulation/r3_wait_localization_active.py --timeout 30 \
         --startup-log "$run_dir/localization.log" \
-        2>&1 | tee -a "$run_dir/localization_activation.log"; then
+        2>&1 | tee 9>&- -a "$run_dir/localization_activation.log"; then
       localization_active=1
       break
     fi
@@ -354,7 +356,7 @@ if [[ $localization == amcl ]]; then
   if [[ $global_localization -eq 1 ]]; then
     echo 'Tìm vị trí toàn bản đồ bằng khớp LiDAR; kiểm tra bằng scan mới trước khi khởi tạo AMCL. Xe đứng yên.'
     echo "Tiến độ: $run_dir/global_scan_initialization.log"
-    setsid env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 simulation/r3_global_localization.py \
+    setsid 9>&- env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 simulation/r3_global_localization.py \
         --map "$map_file" --output "$run_dir/global_scan_initialization.json" --timeout 150 --apply \
         >"$run_dir/global_scan_initialization.log" 2>&1 &
     global_initializer_pid=$!
@@ -374,23 +376,19 @@ if [[ $localization == amcl ]]; then
     # startup load must not interrupt the localization evidence being taught.
     start_navigation
     if [[ $nav_check_only -eq 0 ]]; then
-      setsid python3 simulation/r3_navigation_telemetry.py --output "$run_dir/navigation_motion.jsonl" \
+      setsid 9>&- python3 simulation/r3_navigation_telemetry.py --output "$run_dir/navigation_motion.jsonl" \
         >"$run_dir/navigation_telemetry.log" 2>&1 &
       navigation_telemetry_pid=$!
     fi
   fi
   [[ $localization_only -eq 0 ]] || global_args+=(--stationary-inspection)
   [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]] || global_args+=(--continuous-localization --navigation-monitor --external-control-odom)
-  setsid python3 simulation/r3_amcl_bridge.py --map "$map_file" \
+  setsid 9>&- python3 simulation/r3_amcl_bridge.py --map "$map_file" \
     --wait-ready "$run_dir/localization_ready.json" "${initial_pose_args[@]}" "${global_args[@]}" \
     >"$run_dir/localization_bridge.log" 2>&1 &
   localization_bridge_pid=$!
-  if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
-    setsid python3 simulation/r3_control_odom.py --map "$map_file" >"$run_dir/control_odom.log" 2>&1 &
-    control_odom_pid=$!
-  fi
   if [[ $use_rviz -eq 1 ]]; then
-    setsid rviz2 -d "$root/ros2_ws/config/localization_real.rviz" >"$run_dir/rviz.log" 2>&1 &
+    setsid 9>&- rviz2 -d "$root/ros2_ws/config/localization_real.rviz" >"$run_dir/rviz.log" 2>&1 &
     rviz_pid=$!
   fi
   if [[ $global_localization -eq 1 ]]; then
@@ -409,17 +407,17 @@ if [[ $camera_obstacles -eq 1 ]]; then
   echo 'Mở vật cản RGB-D dùng chung hiệu chỉnh độ sâu với đo pallet: /camera/obstacle_scan (chấm vàng sẫm).'
   floor_alignment=false
   [[ $localization_only -eq 0 ]] || floor_alignment=true
-  setsid ros2 launch camera/detect_astra/launch/r3_existing_camera_obstacles.launch.py \
+  setsid 9>&- ros2 launch camera/detect_astra/launch/r3_existing_camera_obstacles.launch.py \
     floor_alignment:="$floor_alignment" floor_alignment_report:="$run_dir/camera_floor_alignment.json" \
     >"$run_dir/camera_obstacles.log" 2>&1 &
   camera_obstacles_pid=$!
 fi
 
 if [[ $localization_only -eq 1 ]]; then
-  setsid ros2 launch camera/detect_astra/launch/r3_inspection_costmaps.launch.py \
+  setsid 9>&- ros2 launch camera/detect_astra/launch/r3_inspection_costmaps.launch.py \
     >"$run_dir/inspection_costmaps.log" 2>&1 &
   inspection_costmaps_pid=$!
-  setsid python3 simulation/r3_localization_watch.py --map "$map_file" \
+  setsid 9>&- python3 simulation/r3_localization_watch.py --map "$map_file" \
     --output "$run_dir/a_readiness.json" >"$run_dir/a_readiness.log" 2>&1 &
   a_watch_pid=$!
   echo 'Đã mở global/local costmap chỉ để quan sát, gồm LiDAR và camera vật cản đã áp hiệu chỉnh hiện có.'
@@ -436,7 +434,7 @@ if [[ $localization_only -eq 1 ]]; then
 fi
 
 if [[ $save_a -eq 1 ]]; then
-  python3 simulation/r3_recognition_goal.py save --map "$map_file" --output "$goal_file"
+  python3 9>&- simulation/r3_recognition_goal.py save --map "$map_file" --output "$goal_file"
   echo "Đã lưu A mới: $goal_file"
   exit 0
 fi
@@ -450,13 +448,13 @@ if [[ $nav_to_a -eq 1 ]]; then
   if [[ $nav_check_only -eq 0 ]]; then
     # Show the actual current estimate before authorizing motion. A small
     # map-position error can place A behind a forward-only skid-steer robot.
-    if ! python3 simulation/r3_recognition_goal.py navigate --map "$map_file" \
+    if ! python3 9>&- simulation/r3_recognition_goal.py navigate --map "$map_file" \
         --goal "$goal_file" --output "$run_dir/navigation_start_check.json" \
         --continuous-localization --check-only >"$run_dir/navigation_start_check.log" 2>&1; then
       cat "$run_dir/navigation_start_check.log" >&2
       exit 2
     fi
-    python3 simulation/r3_navigation_preview.py --report "$run_dir/navigation_start_check.json"
+    python3 9>&- simulation/r3_navigation_preview.py --report "$run_dir/navigation_start_check.json"
     read -r -p 'Nhấn Enter để tiếp tục đến vùng A / nhận diện; Ctrl+C để hủy: '
   fi
   # Keep the sensor-only localization monitor throughout Nav2 transit. It
@@ -467,11 +465,11 @@ if [[ $nav_to_a -eq 1 ]]; then
     navigation_args+=(--check-only)
     navigation_report="$run_dir/navigation_check.json"
   fi
-  python3 simulation/r3_recognition_goal.py navigate --map "$map_file" \
+  python3 9>&- simulation/r3_recognition_goal.py navigate --map "$map_file" \
     --goal "$goal_file" --output "$navigation_report" "${navigation_args[@]}"
 elif [[ $recognize_here -eq 1 ]]; then
   echo 'Định vị và nhận diện ngay tại vị trí thực tế; không điều chỉnh xe tới tọa độ A.'
-  python3 simulation/r3_recognition_goal.py navigate --map "$map_file" \
+  python3 9>&- simulation/r3_recognition_goal.py navigate --map "$map_file" \
     --goal "$goal_file" --output "$run_dir/recognition_here.json" \
     --continuous-localization --recognize-here
 fi
@@ -490,9 +488,18 @@ if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
   # the same parked scene through AMCL again can collapse particle support.
   handoff_name=localization_at_A
   [[ $recognize_here -eq 0 ]] || handoff_name=localization_at_recognition
-  python3 simulation/r3_enable_trial.py --map "$map_file" \
+  # Start the trial-only odometry owner after Nav2 has released its role.
+  # Navigation/startup traffic must not become a failed trial input epoch.
+  setsid 9>&- python3 simulation/r3_control_odom.py --map "$map_file" \
+    --diagnostics "$run_dir/control_odom_status.jsonl" >"$run_dir/control_odom.log" 2>&1 &
+  control_odom_pid=$!
+  kill -0 "$control_odom_pid" 2>/dev/null || {
+    echo "Tiến trình odom điều khiển đã dừng trước bàn giao; xem $run_dir/control_odom.log." >&2
+    exit 2
+  }
+  python3 9>&- simulation/r3_enable_trial.py --map "$map_file" \
     --output "$run_dir/$handoff_name.json" --timeout 30 \
-    2>&1 | tee "$run_dir/$handoff_name.log"
+    2>&1 | tee 9>&- "$run_dir/$handoff_name.log"
   if [[ $nav_check_only -eq 1 ]]; then
     echo 'Đã kiểm tra định vị, Nav2 và bàn giao A→C; không gửi goal và không chạy bánh.'
     exit 0
@@ -505,7 +512,7 @@ if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
 fi
 
 if [[ $pickup -eq 1 ]]; then
-  python3 simulation/r3_lift_control.py home --execute 2>&1 | tee "$run_dir/lift_home.log"
+  python3 9>&- simulation/r3_lift_control.py home --execute 2>&1 | tee 9>&- "$run_dir/lift_home.log"
 fi
 
 echo 'Bắt đầu nhận diện YOLO và đo pallet RGB-D mới tại A...'
@@ -516,8 +523,8 @@ while true; do
   kill -0 "$bringup_pid" 2>/dev/null || { echo 'Bringup đã dừng; xem bringup.log' >&2; exit 1; }
   prepare_rc=4
   if kill -0 "$perception_pid" 2>/dev/null \
-      && python3 simulation/r3_perception_switch.py recognize --wait-timeout 20; then
-    if python3 simulation/r3_live_prepare.py --output "$run_dir/plan" --timeout 30 --localization "$localization"; then
+      && python3 9>&- simulation/r3_perception_switch.py recognize --wait-timeout 20; then
+    if python3 9>&- simulation/r3_live_prepare.py --output "$run_dir/plan" --timeout 30 --localization "$localization"; then
       break
     else
       prepare_rc=$?
@@ -543,12 +550,12 @@ while true; do
     exit "$prepare_rc"
   fi
 done
-python3 simulation/r3_real_preflight.py --plan "$plan" --allow-provisional
+python3 9>&- simulation/r3_real_preflight.py --plan "$plan" --allow-provisional
 kill -0 "$perception_pid" 2>/dev/null || {
   echo 'Node đo pallet đã dừng trước khi tắt tracking; xem perception.log' >&2
   exit 1
 }
-python3 simulation/r3_perception_switch.py pause --wait-timeout 15
+python3 9>&- simulation/r3_perception_switch.py pause --wait-timeout 15
 echo 'Đã chốt vị trí pallet và tắt YOLO; dừng tracking pallet để giảm tải Pi.'
 echo "Ảnh kế hoạch hai tâm: $run_dir/plan/trajectory.svg"
 if [[ $capture_only -eq 1 ]]; then
@@ -561,7 +568,7 @@ if [[ $capture_only -eq 1 ]]; then
   exit 0
 fi
 
-setsid ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$run_dir" \
+setsid 9>&- ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$run_dir" \
   >"$run_dir/safety.log" 2>&1 &
 safety_pid=$!
 sleep 2
@@ -570,8 +577,8 @@ kill -0 "$safety_pid" 2>/dev/null || { echo 'Bộ dừng vật cản đã dừng
 trial_mode=(--arrive-at-c)
 [[ $pickup -eq 0 ]] || trial_mode=(--pickup)
 set +e
-python3 simulation/r3_real_trial.py --plan "$plan" --output "$run_dir/trial" \
-  --allow-provisional --execute "${trial_mode[@]}" 2>&1 | tee "$run_dir/trial.log"
+python3 9>&- simulation/r3_real_trial.py --plan "$plan" --output "$run_dir/trial" \
+  --allow-provisional --execute "${trial_mode[@]}" 2>&1 | tee 9>&- "$run_dir/trial.log"
 trial_rc=${PIPESTATUS[0]}
 set -e
 [[ $trial_rc -eq 0 ]] || exit "$trial_rc"
@@ -579,7 +586,7 @@ if [[ ! -f "$run_dir/trial/mission_result.json" ]]; then
   echo 'Lượt chạy đã hủy trước khi xe bắt đầu.' >&2
   exit 2
 fi
-mission_status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+mission_status=$(python3 9>&- -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
   "$run_dir/trial/mission_result.json")
 if [[ "$mission_status" == PICKUP_COMPLETE ]]; then
   echo 'Đã chạy A→C→B, dừng bánh tại B và nâng càng lên 8 cm theo phản hồi ESP32.'

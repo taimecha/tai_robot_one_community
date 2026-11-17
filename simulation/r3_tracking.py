@@ -8,7 +8,8 @@ import math
 
 from r3_core import (R3_MIN_STRAIGHT_CLEARANCE_M, collision, compose, dense,
                      errors, fork_for_base, wrap)
-from r3_insertion_clearance import insertion_clearance
+from r3_insertion_clearance import insertion_motion_clearance
+from r3_longitudinal_control import MeasuredSpeedControl, profiled_speed
 
 
 def stationary_heading_command(current_yaw, goal_yaw, max_angular_rps):
@@ -204,12 +205,24 @@ class FixedPlanFollower:
         self.state = 'PREVIEW_WAIT'
         self.follower = None
         self.v = 0.
+        self.reference_v = 0.
+        self.speed_control = MeasuredSpeedControl()
+        self.braking_overspeed_reserve_m = 0.
+        self.terminal_goal_report = None
         self.reason = ''
         self.align_goal = None
         self.w = 0.
         self.join_stopped_s = 0.
         self.align_stable_s = 0.
         self.curvature = []
+
+    def reset_motion(self):
+        """Restart from a real zero-command hold without retained speed effort."""
+        self.v = self.w = self.reference_v = 0.
+        self.speed_control.reset()
+        self.insertion_heading_pid.reset_effort()
+        if self.follower is not None:
+            self.follower.v = 0.
 
     def align(self, pose, goal_yaw, dt):
         if errors(pose, self.target, self.g)['gap_m'] <= self.g['fork_length']:
@@ -233,11 +246,15 @@ class FixedPlanFollower:
         return True
 
     def step(self, pose, dt=.05, obstacle=False, odom_valid=True, c_verified=True,
-             insertion_yaw=None, insertion_yaw_rate=0., insertion_pose=None):
+             insertion_yaw=None, insertion_yaw_rate=0., insertion_pose=None,
+             measured_speed=None):
         if obstacle or not odom_valid:
             self.state = 'STOP_LATCHED'
             self.reason = 'obstacle stop' if obstacle else 'invalid odom'
         if self.state in ('PREVIEW_WAIT', 'STOP_LATCHED', 'STOPPED', 'C_REACHED'):
+            return 0., 0.
+        if measured_speed is not None and not math.isfinite(measured_speed):
+            self.state, self.reason = 'STOP_LATCHED', 'invalid measured speed'
             return 0., 0.
         if self.align_goal is not None:
             if abs(wrap(self.align_goal-pose[2])) < math.radians(self.alignment_done_deg):
@@ -290,6 +307,14 @@ class FixedPlanFollower:
         end = phase['poses'][-1]
         dx, dy = end[0]-pose[0], end[1]-pose[1]
         remaining = dx*math.cos(end[2])+dy*math.sin(end[2])
+        # At rest, use the SAME B tolerance as the post-braking/lift gate.
+        # Chasing the tighter moving endpoint from an already valid stopped
+        # pose can stall the drive and falsely end as "no odom progress".
+        b_tolerance = min(.005, self.g['stop_gap_tolerance'])
+        stationary_b = (self.continuous_insertion and measured_speed is not None
+            and abs(measured_speed) < .005 and abs(insertion_yaw_rate) < .005
+            and abs(remaining) <= b_tolerance
+            and abs(e['gap_m']-self.g['stop_gap']) <= b_tolerance)
         if self.continuous_insertion:
             if collision(pose, self.target, self.g):
                 self.state, self.reason = 'STOP_LATCHED', 'pickup footprint intersects pallet'
@@ -303,21 +328,7 @@ class FixedPlanFollower:
                 or to_c <= self.insertion_heading_lead_in_m)
             if self.insertion_heading_active:
                 self.insertion_heading = wrap(self.target[2]-self.g['base_fork'][2])
-                # The angular loop uses the camera-at-A frame. Its larger
-                # steering authority must also fit BOTH full-tine estimates,
-                # not only a map-corrected pose whose yaw can differ by ~1 deg.
-                if insertion_pose is not None:
-                    self.insertion_camera_frame_report = insertion_clearance(
-                        insertion_pose, self.target, self.g)
-                    if not self.insertion_camera_frame_report['ready']:
-                        self.state, self.reason = ('STOP_LATCHED', 'camera-frame '
-                            +self.insertion_camera_frame_report['reason'])
-                        return 0., 0.
             if to_c <= .005:
-                self.insertion_report = insertion_clearance(pose, self.target, self.g)
-                if not self.insertion_report['ready']:
-                    self.state, self.reason = 'STOP_LATCHED', self.insertion_report['reason']
-                    return 0., 0.
                 self.insertion_started = True
                 self.state = 'STRAIGHT'
         if self.approach_only:
@@ -334,7 +345,7 @@ class FixedPlanFollower:
             if abs(e['ey_m']) > self.g['max_lateral'] or abs(e['yaw_error_rad']) > math.radians(self.g['max_yaw_deg']):
                 self.state, self.reason = 'STOP_LATCHED', 'terminal yaw/lateral limit exceeded'
                 return 0., 0.
-        if remaining < -self.endpoint_tolerance_m:
+        if remaining < -self.endpoint_tolerance_m and not stationary_b:
             self.state, self.reason = 'STOP_LATCHED', 'phase endpoint overshot'
             return 0., 0.
         if (not self.approach_only and phase['type'] == 'APPROACH' and self.phase+1 < len(self.phases)
@@ -368,7 +379,7 @@ class FixedPlanFollower:
             self.join_stopped_s = 0.
             self.state = self.phases[self.phase]['type']
             return 0., 0.
-        if abs(remaining) <= self.endpoint_tolerance_m:
+        if abs(remaining) <= self.endpoint_tolerance_m or stationary_b:
             self.v = 0.
             if self.phase+1 < len(self.phases):
                 # Existing settle interval: do not switch curvature/align
@@ -405,8 +416,14 @@ class FixedPlanFollower:
                 return 0., 0.
             self.state = 'STOPPED'
             self.w = 0.
+            self.terminal_goal_report = dict(stationary_tolerance_used=stationary_b,
+                gap_m=e['gap_m'], target_gap_m=self.g['stop_gap'],
+                gap_tolerance_m=b_tolerance,
+                measured_speed_mps=measured_speed, measured_yaw_rate_rps=insertion_yaw_rate)
             return 0., 0.
-        previous_v = self.v
+        previous_v, previous_w = self.v, self.w
+        speed_feedback = (self.approach_only or self.continuous_insertion) and measured_speed is not None
+        previous_reference = self.reference_v if speed_feedback else previous_v
         v, w = self.follower.step(*pose)
         # Brake by available deceleration. A linear remaining-distance cap
         # drove the real robot below 1 mm/s near C, where its motors stalled.
@@ -420,7 +437,9 @@ class FixedPlanFollower:
             # Include a delayed control cycle as well as transport at B,
             # whose longitudinal stopping tolerance is tighter than C's.
             latency = self.b_command_latency_s if self.continuous_insertion else self.c_command_latency_s
-            v = min(v, math.sqrt((a*latency)**2+2*a*budget)-a*latency)
+            limit, self.braking_overspeed_reserve_m = profiled_speed(
+                budget, a, latency+(dt if speed_feedback else 0.), measured_speed, previous_reference)
+            v = min(v, limit)
         else:
             v = min(v, math.sqrt(2*self.g['acceleration']*max(0., remaining)))
         # Same PP curvature, with speed profiling applied consistently to omega.
@@ -447,10 +466,14 @@ class FixedPlanFollower:
         # Honor the existing acceleration/deceleration limit and let steering
         # saturation/error checks report any infeasible tracking transition.
         dv=self.g['acceleration']*dt
-        v=max(previous_v-dv,min(previous_v+dv,v))
+        v=max(previous_reference-dv,min(previous_reference+dv,v))
         v=max(0.,min(self.g['max_speed'],v))
-        # Reset speed state to the actual profile output; no minimum-speed floor.
-        self.follower.v = self.v = v
+        self.follower.v = self.reference_v = v
+        if speed_feedback:
+            v = self.speed_control.step(v, measured_speed, previous_v, dt,
+                                       self.g['acceleration'], self.g['max_speed'])
+        self.v = v
+        tracking_speed = self.reference_v
         straight_hold = self.continuous_insertion and self.insertion_heading_active
         if straight_hold:
             # Geometry/collision checks retain the shared localized pose.
@@ -459,7 +482,7 @@ class FixedPlanFollower:
             feedback_yaw = pose[2] if insertion_yaw is None else insertion_yaw
             try:
                 desired_w = self.insertion_heading_pid.step(feedback_yaw,
-                    self.insertion_heading, insertion_yaw_rate, dt, v)
+                    self.insertion_heading, insertion_yaw_rate, dt, tracking_speed)
             except ValueError as exc:
                 self.state, self.reason = 'STOP_LATCHED', str(exc)
                 return 0., 0.
@@ -474,7 +497,8 @@ class FixedPlanFollower:
             lateral = (-(pose[0]-ref[0])*math.sin(ref[2])
                        +(pose[1]-ref[1])*math.cos(ref[2]))
             heading = wrap(pose[2]-ref[2])
-            desired_w = v*signed_curvature - 2.*math.sin(heading) - 16.*v*lateral
+            desired_w = (tracking_speed*signed_curvature - 2.*math.sin(heading)
+                         - 16.*tracking_speed*lateral)
             # The same feedback law runs through the straight lead-in, so
             # lateral feedback is not discarded at its boundary.
             if (not self.approach_only and phase['type'] == 'APPROACH'
@@ -494,47 +518,47 @@ class FixedPlanFollower:
                 return 0., 0.
             desired_w = 1.2*wrap(end[2]-pose[2])
         else:
-            desired_w = v*kappa
+            desired_w = tracking_speed*kappa
         w = max(-self.g['max_omega'], min(self.g['max_omega'], desired_w))
         dw = self.g['angular_acceleration']*dt
         w = max(self.w-dw, min(self.w+dw, w))
         if straight_hold:
             # Small heading trims while translating; reducing speed at B
             # must also reduce steering, never turn into a stationary pivot.
-            trim_limit = self.insertion_heading_pid.trim_limit(v)
+            trim_limit = self.insertion_heading_pid.trim_limit(tracking_speed)
             w = max(-trim_limit, min(trim_limit, w))
         self.w = w
         if self.continuous_insertion:
-            horizon = self.b_command_latency_s if self.insertion_started else .20
-            angle = w*horizon
-            travel = ((v*horizon, 0., angle) if abs(w) < 1e-9 else
-                      (v/w*math.sin(angle), v/w*(1-math.cos(angle)), angle))
-            predicted = compose(pose, travel)
+            latency = self.b_command_latency_s if self.insertion_started else self.c_command_latency_s
+            frames = [('control', pose)]
             if straight_hold and insertion_pose is not None:
-                raw_predicted = compose(insertion_pose, travel)
-                report = insertion_clearance(raw_predicted, self.target, self.g)
-                self.insertion_camera_frame_report = report
-                if not report['ready']:
-                    self.state, self.reason = ('STOP_LATCHED', 'predicted camera-frame '
-                        +report['reason'])
-                    return 0., 0.
-                for sample in dense([insertion_pose, raw_predicted]):
-                    if collision(sample, self.target, self.g):
-                        self.state, self.reason = ('STOP_LATCHED',
-                            'pickup predicted camera-frame footprint intersects pallet')
+                frames.append(('camera-at-A', insertion_pose))
+            for frame, frame_pose in frames:
+                # Check both the command still in the drive pipeline and the
+                # proposed correction. Include measured yaw rate during the
+                # heading handoff: the chassis may still be turning the other
+                # way. Never assume that a new PID output acted instantly.
+                commands = [('previous_command', previous_v, previous_w),
+                            ('next_command', v, w)]
+                if straight_hold or measured_speed is not None:
+                    commands.append(('measured_motion',
+                        max(previous_v, v, abs(measured_speed or 0.)), insertion_yaw_rate))
+                checked_commands = set()
+                for source, speed, omega in commands:
+                    if (speed, omega) in checked_commands:
+                        continue
+                    checked_commands.add((speed, omega))
+                    report = insertion_motion_clearance(frame_pose, self.target, self.g,
+                        speed, omega, latency_s=latency)
+                    report['velocity_source'] = source
+                    if frame == 'camera-at-A':
+                        self.insertion_camera_frame_report = report
+                    else:
+                        self.insertion_report = report
+                    if not report['ready']:
+                        self.state, self.reason = 'STOP_LATCHED', frame+' '+report['reason']
+                        self.v = self.w = self.follower.v = 0.
                         return 0., 0.
-            if self.insertion_started:
-                report = insertion_clearance(predicted, self.target, self.g)
-                if not report['ready']:
-                    self.insertion_report = report
-                    self.state, self.reason = 'STOP_LATCHED', 'predicted '+report['reason']
-                    return 0., 0.
-            # Check both tines and chassis over the next command's travel.
-            # Actual obstacles remain under the LiDAR collision monitor.
-            for predicted in dense([pose, predicted]):
-                if collision(predicted, self.target, self.g):
-                    self.state, self.reason = 'STOP_LATCHED', 'pickup predicted footprint intersects pallet'
-                    return 0., 0.
         return v, w
 
 

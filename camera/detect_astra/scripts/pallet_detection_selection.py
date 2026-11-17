@@ -2,6 +2,9 @@
 import math
 
 PALLET_CLASSES = ('pallets', 'emty pallet')
+# Count only candidates that can qualify semantic acquisition. A weak false
+# positive must not veto a separate, otherwise valid pallet indefinitely.
+MIN_PALLET_CONFIDENCE = .75
 
 
 def unique_pallet_indices(boxes, classes, confidence, names):
@@ -12,6 +15,7 @@ def unique_pallet_indices(boxes, classes, confidence, names):
     for i in candidates:
         box = boxes[i]
         if (not all(math.isfinite(float(v)) for v in (*box, confidence[i]))
+                or not MIN_PALLET_CONFIDENCE <= confidence[i] <= 1.
                 or box[2] <= box[0] or box[3] <= box[1]):
             continue
         duplicate = False

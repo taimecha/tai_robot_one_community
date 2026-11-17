@@ -551,6 +551,8 @@ def main():
                     rgb_tracker_acknowledged=state.get('rgb_tracker_acknowledged'),
                     rgb_tracker_issue=(state.get('rgb_tracker') or {}).get('issue'),
                     inference_ms=state.get('inference_ms'), last_issue=state.get('last_issue', ''),
+                    min_pallet_confidence=state.get('min_pallet_confidence'),
+                    pallet_candidates=state.get('pallet_candidates', []),
                     capture=node.capture_diagnostics(),
                     robot_commands=0), ensure_ascii=False), flush=True)
                 last_progress_log = wall

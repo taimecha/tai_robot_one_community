@@ -28,7 +28,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import Imu, LaserScan
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Float64MultiArray
 from detected_pallets_interfaces.msg import PalletTarget
 
 from r3_core import FrozenPlan, errors, fork_for_base, wrap, compose
@@ -175,7 +175,8 @@ class OdomImuDiagnostics:
     sensor_msgs/Imu does not contain the BNO055's calibration status.
     """
     def __init__(self, max_samples=6000, interval_s=.05):
-        self.latest = {'wheel_odom': None, 'fused_odom': None, 'imu': None, 'localized_odom': None}
+        self.latest = {'wheel_odom': None, 'fused_odom': None, 'imu': None,
+                       'localized_odom': None, 'wheel_pid': None}
         self.rows = deque(maxlen=max_samples)
         self.interval_s = interval_s
         self.last_sample = None
@@ -208,6 +209,16 @@ class OdomImuDiagnostics:
             angular_velocity_covariance=diagnostic_numbers(msg.angular_velocity_covariance),
             linear_acceleration_covariance=diagnostic_numbers(msg.linear_acceleration_covariance),
             calibration_status_available=False)
+
+    def on_wheel_pid(self, msg, received):
+        if len(msg.data) != 18:
+            return
+        values = diagnostic_numbers(msg.data)
+        self.latest['wheel_pid'] = dict(received_monotonic_s=received,
+            sequence=values[0], uptime_ms=values[1],
+            wheels={name: dict(target_rad_s=values[2+4*i], measured_rad_s=values[3+4*i],
+                output_pwm=values[4+4*i], position_rad=values[5+4*i])
+                for i, name in enumerate(('FL', 'FR', 'RL', 'RR'))})
 
     def sample(self, monotonic_s, wall_s, state, pose, command, heading_source='odom_ekf'):
         if self.last_sample is not None and monotonic_s-self.last_sample < self.interval_s-1e-6:
@@ -372,6 +383,8 @@ class RealTrial(Node):
                 self.subscribe_input(String, '/pallet/r3/control_odom/status',self.on_control_odom_status,
                     QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.subscribe_input(Odometry, '/base_controller/odom', self.on_wheel_odom, latest_sensor)
+        self.subscribe_input(Float64MultiArray, '/wheel_pid_telemetry',
+            lambda msg: self.diagnostics.on_wheel_pid(msg, time.monotonic()), latest_sensor)
         self.subscribe_input(Imu, '/imu', self.on_imu, latest_sensor)
         self.subscribe_input(LaserScan, '/pallet/r3/filtered_lidar_scan',
                              lambda _: self.on_scan('lidar'), latest_sensor)
@@ -505,9 +518,7 @@ class RealTrial(Node):
         if to_c > .12:
             return True
         self.send()
-        self.follow.v = self.follow.w = 0.
-        if self.follow.follower is not None:
-            self.follow.follower.v = 0.
+        self.follow.reset_motion()
         self.last_tick = self.last_progress_wall = wall
         self.state = 'WAIT_INSERTION_FRAME'
         if self.insertion_lock_wait_since is None:
@@ -689,6 +700,9 @@ class RealTrial(Node):
                     active=self.sensor_hold_since is not None, reason=self.sensor_hold_reason,
                     duration_s=(time.monotonic()-self.sensor_hold_since
                                 if self.sensor_hold_since is not None else 0.))
+                self.diagnostics.rows[-1]['longitudinal_control'] = dict(
+                    self.follow.speed_control.report or {},
+                    braking_overspeed_reserve_m=self.follow.braking_overspeed_reserve_m)
             if self.localization and sampled:
                 self.diagnostics.rows[-1]['localization'] = self.localization_status
                 self.diagnostics.rows[-1]['control_odom_status'] = self.control_odom_status
@@ -749,10 +763,7 @@ class RealTrial(Node):
                 return
             # The last physical command during a sensor gap was zero. Resume
             # the profile from zero after all sources become fresh again.
-            self.follow.v = self.follow.w = 0.
-            self.follow.insertion_heading_pid.reset_effort()
-            if self.follow.follower is not None:
-                self.follow.follower.v = 0.
+            self.follow.reset_motion()
             self.last_tick = self.last_progress_wall = wall
             if self.sensor_holds:
                 self.sensor_holds[-1].update(resumed=True,
@@ -961,7 +972,8 @@ class RealTrial(Node):
                                 insertion_yaw=raw_reference_pose[2],
                                 insertion_yaw_rate=(self.imu_yaw_rate if self.imu_yaw_rate is not None
                                     else self.twist[1] if self.twist else 0.),
-                                insertion_pose=raw_reference_pose)
+                                insertion_pose=raw_reference_pose,
+                                measured_speed=self.twist[0] if self.twist else None)
         if self.follow.state == 'STOP_LATCHED':
             if self.pickup:
                 self.insertion_report = self.follow.insertion_report
@@ -973,9 +985,9 @@ class RealTrial(Node):
         if self.pickup and self.follow.insertion_started and not self.insertion_logged:
             self.insertion_logged = True
             self.get_logger().info('Tiếp tục C→B, bám góc 0° theo trục pallet bằng encoder/IMU gắn mốc A; '
-                'khe hở ước lượng nhỏ nhất '
+                'khe hở ngang ước lượng tại C '
                 f'{self.follow.insertion_report["minimum_clearance_m"]*1000:.1f} mm '
-                '(đã kiểm tra cả hai càng tới B). '
+                '(đã kiểm tra cả hai càng trong quãng lệnh và phanh). '
                 f'Góc encoder/IMU tại C: {math.degrees(wrap(raw_reference_pose[2]-self.target[2])):+.2f}°.')
         if ((self.stop_at_c and self.follow.state == 'C_SETTLE')
                 or (self.arrive_at_c and self.follow.state == 'C_REACHED')):
@@ -1217,6 +1229,9 @@ def main():
                 'insertion_frame_lock': node.insertion_frame_lock,
                 'insertion_camera_frame_clearance': node.follow.insertion_camera_frame_report,
                 'insertion_heading_rad': node.follow.insertion_heading,
+                'longitudinal_control': dict(node.follow.speed_control.report or {},
+                    braking_overspeed_reserve_m=node.follow.braking_overspeed_reserve_m),
+                'terminal_goal_check': node.follow.terminal_goal_report,
                 'insertion_heading_control': dict(
                     feedback_source='camera_at_A_with_encoder_imu_yaw_change',
                     rate_feedback_source=('imu_gyro' if node.imu_yaw_rate is not None else 'fused_odom'),

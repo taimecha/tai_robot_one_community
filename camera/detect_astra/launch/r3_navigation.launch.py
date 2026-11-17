@@ -9,7 +9,6 @@ import sys
 import tempfile
 
 import yaml
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import ExecuteProcess, OpaqueFunction
 from launch_ros.actions import Node
@@ -28,8 +27,7 @@ def navigation_parameters():
                     real_time(item)
     real_time(params)
     bt=params['bt_navigator']['ros__parameters']
-    bt['default_nav_to_pose_bt_xml']=str(Path(get_package_share_directory('nav2_bt_navigator'))/
-        'behavior_trees/navigate_w_replanning_only_if_path_becomes_invalid.xml')
+    bt['default_nav_to_pose_bt_xml']=str(root/'simulation/r3/nav_to_a_straight_first.xml')
     bt['bt_loop_duration']=50
     # The stock tree uses standard nodes, not the old route/recovery plugins.
     # Jazzy loads its built-in BT nodes by default. An empty YAML sequence
@@ -57,9 +55,12 @@ def navigation_parameters():
     # Native Smac2D ends on a grid coordinate, which can differ from saved A.
     # Its opt-in wrapper collision-checks the short connector to exact A.
     planner=params['planner_server']['ros__parameters']
+    planner['planner_plugins']=['GridShortest','GridBased']
     for name in ('GridShortest','GridBased'):
         planner[name].update(plugin='tai_robot_one::ExactGoalSmac2D',
-            tolerance=0.,use_final_approach_orientation=False)
+            tolerance=0.,use_final_approach_orientation=False,
+            prefer_straight_path=True,
+            straight_goal_xy_tolerance=control['general_goal_checker']['xy_goal_tolerance'])
     for layer in ('local_costmap','global_costmap'):
         costmap=params[layer][layer]['ros__parameters']
         for optional in ('camera_obstacle_layer','fork_safety_layer','rear_safety_layer'):

@@ -45,6 +45,59 @@ def process_relationship(pid):
         return None
 
 
+def holds_session_lock(pid, path):
+    """Match the inode AND the inherited flock, not merely an open filename."""
+    try:
+        target=Path(path).stat()
+        for fd in Path(f'/proc/{pid}/fd').iterdir():
+            try:
+                current=fd.stat()
+                if (current.st_dev,current.st_ino)!=(target.st_dev,target.st_ino):
+                    continue
+                info=Path(f'/proc/{pid}/fdinfo/{fd.name}').read_text()
+                if any(line.startswith('lock:') and 'FLOCK' in line and 'WRITE' in line
+                       for line in info.splitlines()):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def orphan_lock_holders(root, lock):
+    """Allow recovery only after the recorded owner has exited.
+
+    A process must actually hold this flock and belong to this checkout.
+    Never infer permission from an obsolete PID or a generic ROS node name.
+    """
+    holders=[]
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit() or int(process.name)==os.getpid():
+            continue
+        pid=int(process.name)
+        try:
+            if process.stat().st_uid!=os.getuid() or not holds_session_lock(pid,lock):
+                continue
+            identity=process_identity(pid)
+            if identity is None:
+                continue
+            args,_=identity
+            if any(Path(os.fsdecode(arg)).name=='run_r3_live_trial.sh' for arg in args if arg):
+                raise RuntimeError(f'Phiên R3 PID {pid} đang giữ khóa nhưng chưa khớp tệp phiên; không dọn như tiến trình mồ côi.')
+            # A project path in an arbitrary output argument is not ownership.
+            # Check the executable/script or its actual working directory.
+            prefix=os.fsencode(str(root)+'/')
+            project=(any(arg.startswith(prefix) for arg in args[:2])
+                     or (process/'cwd').resolve()==root)
+            if not project:
+                raise RuntimeError(f'Khóa R3 được PID {pid} ngoài dự án giữ; không tự gửi tín hiệu.')
+            holders.append((pid,identity))
+        except OSError:
+            continue
+    return holders
+
+
 def interrupt_owner(pid,owner):
     """Unblock a foreground prompt while retaining the owner's cleanup traps.
 
@@ -103,6 +156,8 @@ def stop_session(root,timeout=90.,poll_interval=.05):
     folder=root/'simulation/output/r3_live'
     session=folder/'localization_session.json'
     lock=folder/'.trial.lock'
+    if lock_available(lock):
+        return 'Khóa R3 đã được nhả; có thể chạy lượt mới.'
     owner=None;pid=None
     if session.is_file():
         try:
@@ -124,10 +179,36 @@ def stop_session(root,timeout=90.,poll_interval=.05):
             interrupt_owner(pid,owner)
             print('Đang đóng phiên định vị, chờ các tiến trình con dừng và nhả khóa...',flush=True)
     deadline=time.monotonic()+timeout
+    orphan_started=None
+    next_orphan_scan=0.
+    orphan_signals={}
     while True:
         same_owner=owner is not None and process_identity(pid)==owner
         if not same_owner and lock_available(lock):
             return 'Đã đóng phiên định vị và nhả khóa; có thể chạy lượt mới.'
+        now=time.monotonic()
+        if not same_owner and now>=next_orphan_scan:
+            holders=orphan_lock_holders(root,lock)
+            next_orphan_scan=now+.25
+            if not holders:
+                if lock_available(lock):
+                    return 'Đã nhả khóa R3; có thể chạy lượt mới.'
+                raise RuntimeError('Chủ phiên đã thoát nhưng khóa còn bị giữ; không xác minh được tiến trình giữ khóa.')
+            if orphan_started is None:
+                orphan_started=now
+                print('Chủ phiên đã thoát; đóng tiến trình con còn giữ khóa: '
+                      +', '.join(str(p) for p,_ in holders),flush=True)
+            elapsed=now-orphan_started
+            sig=signal.SIGKILL if elapsed>=4. else signal.SIGTERM if elapsed>=2. else signal.SIGINT
+            for orphan,identity in holders:
+                key=(orphan,identity[1])
+                if (orphan_signals.get(key)!=sig and process_identity(orphan)==identity
+                        and holds_session_lock(orphan,lock)):
+                    try:
+                        os.kill(orphan,sig)
+                        orphan_signals[key]=sig
+                    except ProcessLookupError:
+                        pass
         if time.monotonic()>=deadline:
             raise RuntimeError(f'Chưa đóng hoàn toàn sau {timeout:g} giây; khóa R3 vẫn có thể đang được giữ. '
                                'Chưa được chạy lượt mới; kiểm tra tiến trình của phiên cũ.')
@@ -145,6 +226,9 @@ def main():
     except (RuntimeError,ValueError,OSError) as exc:
         print(str(exc),flush=True)
         return 2
+    except KeyboardInterrupt:
+        print('Đã ngắt lệnh chờ dừng; phiên R3 có thể chưa đóng hết.',flush=True)
+        return 130
 
 
 if __name__=='__main__':

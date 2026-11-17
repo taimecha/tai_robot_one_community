@@ -119,6 +119,14 @@ def rectangle(pose, bounds):
 
 def overlap(a, b):
     """Separating-axis test for oriented convex rectangles, including contact."""
+    # Most pickup checks compare disjoint rectangles. Reject disjoint axis
+    # bounds before the oriented SAT; overlapping bounds still use the full
+    # test below. Contact remains occupied because all comparisons are strict.
+    ax, ay = zip(*a)
+    bx, by = zip(*b)
+    if (max(ax) < min(bx) or max(bx) < min(ax)
+            or max(ay) < min(by) or max(by) < min(ay)):
+        return False
     for poly in (a, b):
         for p, q in zip(poly, poly[1:]+poly[:1]):
             nx, ny = -(q[1]-p[1]), q[0]-p[0]

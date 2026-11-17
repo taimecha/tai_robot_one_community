@@ -7,6 +7,7 @@ import time
 import cv2
 import numpy as np
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from rclpy.utilities import get_rmw_implementation_identifier
 from sensor_msgs.msg import Image, CameraInfo
@@ -166,7 +167,11 @@ class CameraReceiver(Node):
                                         reliability=ReliabilityPolicy.BEST_EFFORT,
                                         durability=DurabilityPolicy.VOLATILE)))
 
-        self.registration_timer = self.create_timer(1.0, self.check_registration)
+        # ROS graph/parameter inspection can take hundreds of milliseconds.
+        # Keep it serialized with itself, independently of image delivery.
+        self.registration_group = MutuallyExclusiveCallbackGroup()
+        self.registration_timer = self.create_timer(
+            1.0, self.check_registration, callback_group=self.registration_group)
 
     def source_callback(self, stream, camera_info):
         # Exactly two callback arguments requests ROS MessageInfo (publisher GID).
@@ -238,6 +243,13 @@ class CameraReceiver(Node):
 
     def set_registration(self, verified, reason):
         with self.lock:
+            # Image callbacks may discover a second actual writer while the
+            # graph check is in flight. Its stale snapshot cannot re-enable XYZ.
+            if verified:
+                for key in ('rgb', 'depth', 'rgb_info'):
+                    if len(self.source_observations.get(key, {})) > 1:
+                        verified, reason = False, f'multiple observed {key} GIDs'
+                        break
             self.registration = dict(verified=verified, reason=reason,
                                      node=self.registration_node,
                                      parameter='depth_registration',
@@ -263,7 +275,9 @@ class CameraReceiver(Node):
                 if self.registration_client is not None:
                     self.destroy_client(self.registration_client)
                 self.registration_node = source
-                self.registration_client = self.create_client(GetParameters, source + '/get_parameters')
+                self.registration_client = self.create_client(
+                    GetParameters, source + '/get_parameters',
+                    callback_group=self.registration_group)
                 self.registration_future = None
                 self.set_registration(False, 'waiting for camera parameter service')
             future = self.registration_future

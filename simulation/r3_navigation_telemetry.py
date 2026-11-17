@@ -11,7 +11,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import Twist,TwistStamped,PoseWithCovarianceStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry,Path as NavPath
 from sensor_msgs.msg import Imu,LaserScan
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
@@ -26,6 +26,7 @@ class NavigationTelemetry(Node):
         super().__init__('r3_navigation_telemetry')
         output.parent.mkdir(parents=True,exist_ok=True)
         self.file=output.open('w',buffering=65536);self.latest={};self.ticks=0
+        self.plans_file=output.with_name('navigation_plans.jsonl').open('w',buffering=65536)
         self.last_record_at=time.monotonic()
         self.file.write(json.dumps(dict(schema='r3_navigation_motion_v2',
             observer_only=True,robot_commands_from_this_process=0))+'\n')
@@ -39,6 +40,7 @@ class NavigationTelemetry(Node):
                 lambda m,t=topic:self.odometry(t,m),qos_profile_sensor_data)
         self.create_subscription(Imu,'/imu',self.imu,qos_profile_sensor_data)
         self.create_subscription(PoseWithCovarianceStamped,'/amcl_pose',self.amcl,qos_profile_sensor_data)
+        self.create_subscription(NavPath,'/plan',self.plan,qos_profile_sensor_data)
         # Capture both ends of the filter and the actual TF edge stamps. An
         # AMCL pose callback delayed in another process cannot establish
         # whether LiDAR delivery, AMCL processing or that observer was late.
@@ -47,6 +49,8 @@ class NavigationTelemetry(Node):
                 lambda m,t=topic:self.scan(t,m),qos_profile_sensor_data)
         self.create_subscription(TFMessage,'/tf',self.transforms,qos_profile_sensor_data)
         self.create_subscription(String, '/pallet/r3/localization/status', self.localization,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, '/pallet/r3/control_odom/status', self.control_odometry,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_timer(.05,self.record)
     def now(self):return self.get_clock().now().nanoseconds*1e-9
@@ -68,6 +72,16 @@ class NavigationTelemetry(Node):
         p=msg.pose.pose
         self.latest['/amcl_pose']=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),x=finite(p.position.x),
             y=finite(p.position.y),yaw=self.yaw(p.orientation))
+    def plan(self,msg):
+        poses=[[finite(p.pose.position.x),finite(p.pose.position.y),self.yaw(p.pose.orientation)]
+               for p in msg.poses]
+        length=sum(math.hypot(b[0]-a[0],b[1]-a[1])
+                   for a,b in zip(poses,poses[1:]) if None not in (*a[:2],*b[:2]))
+        self.plans_file.write(json.dumps(dict(ros_s=self.now(),stamp_ros_s=self.stamp(msg),
+            topic='/plan',frame_id=msg.header.frame_id,poses_xyyaw=poses,
+            goal_pose_stamp_ros_s=self.stamp(msg.poses[-1]) if msg.poses else None,
+            path_length_m=length,robot_commands_from_this_process=0),allow_nan=False)+'\n')
+        self.plans_file.flush()
     def scan(self,topic,msg):
         self.latest[topic]=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),
             frame_id=msg.header.frame_id,beam_count=len(msg.ranges),scan_time_s=finite(msg.scan_time))
@@ -97,6 +111,17 @@ class NavigationTelemetry(Node):
         self.ticks+=1
         if self.ticks%20==0:self.file.flush()
 
+    def control_odometry(self,msg):
+        try:
+            value=json.loads(msg.data)
+            self.latest['control_odom_status']={key:value.get(key) for key in (
+                'published_ros_s','ready','reason','integrity_fault','control_mode',
+                'control_stream_id','output_samples','raw_input_samples',
+                'latest_input_capture_stamp_s','latest_input_received_ros_s',
+                'latest_output_capture_stamp_s')}
+        except (ValueError,TypeError,AttributeError):
+            pass
+
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -105,7 +130,7 @@ def main():
     try:rclpy.spin(node)
     except (KeyboardInterrupt,ExternalShutdownException):pass
     finally:
-        node.file.flush();node.file.close();node.destroy_node()
+        node.file.flush();node.file.close();node.plans_file.close();node.destroy_node()
         if rclpy.ok():rclpy.shutdown()
 
 

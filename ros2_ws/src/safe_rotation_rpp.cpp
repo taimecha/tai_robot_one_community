@@ -268,7 +268,7 @@ private:
       terminal_slow_turn_ = std::abs(goal_yaw_error) <= 1.8;
     }
     terminal_arrival_seen_ = terminal_arrival_seen_ || at_goal;
-    if (predictive_terminal_braking_ && terminal_braking_) {
+    if (terminal_braking_) {
       // Keep zero through real braking and feedback delivery. Do not turn
       // back the other way on a still-moving chassis because one TF sample
       // has crossed the heading target.
@@ -293,6 +293,11 @@ private:
     if (aligning_terminal_yaw_ && std::abs(goal_yaw_error) <= yaw_tolerance) {
       aligning_terminal_yaw_ = false;
       turning_ = false;
+      terminal_braking_ = true;
+      terminal_stop_ticks_ = 0;
+      geometry_msgs::msg::TwistStamped stop;
+      stop.header = pose.header;
+      return stop;
     }
     if (aligning_terminal_yaw_ && std::hypot(end.position.x, end.position.y) > 0.15) {
       aligning_terminal_yaw_ = false;
@@ -345,6 +350,20 @@ private:
       short_reverse_plan_ ? -end.position.x : end.position.x,
       short_reverse_plan_ ? -end.position.y : end.position.y, remaining_length, xy_tolerance);
     const bool goal_rotation = has_reached_xy_tolerance_ || aligning_terminal_yaw_;
+    if (turning_ && goal_rotation != turning_to_goal_) {
+      // Entering/leaving the XY disk changes the requested heading from the
+      // route bearing to the saved goal yaw. Never keep integrating the old
+      // remaining angle under the new role: stop, then select a fresh sweep.
+      turning_ = false;
+      terminal_braking_ = true;
+      terminal_stop_ticks_ = 0;
+      RCLCPP_INFO(logger_, "Stopping before turn reference changes from %s to %s",
+        turning_to_goal_ ? "goal yaw" : "route heading",
+        goal_rotation ? "goal yaw" : "route heading");
+      geometry_msgs::msg::TwistStamped stop;
+      stop.header = pose.header;
+      return stop;
+    }
     if (remaining_length <= 0.15) {
       RCLCPP_DEBUG_THROTTLE(logger_, *costmap_ros_->get_clock(), 1000,
         "terminal xy=(%.3f,%.3f) yaw=%.3f remaining=%.3f at=%d align=%d turning=%d angle=%.3f error=%.3f",
@@ -371,6 +390,7 @@ private:
         remaining_ = *chosen;
         turn_tolerance_ = goal_rotation ? yaw_tolerance : 0.04;
         turning_ = true;
+        turning_to_goal_ = goal_rotation;
         last_yaw_ = yaw;
       }
     } else {
@@ -384,6 +404,10 @@ private:
       is_rotating_to_heading_pub_->publish(rotating);
       if (std::abs(remaining_) < turn_tolerance_) {
         turning_ = false;
+        if (goal_rotation) {
+          terminal_braking_ = true;
+          terminal_stop_ticks_ = 0;
+        }
         // Stop before handing translation back to RPP.
         geometry_msgs::msg::TwistStamped stop;
         stop.header = pose.header;
@@ -426,15 +450,8 @@ private:
       if (predictive_terminal_braking_ && terminal_turn) {
         angular_limit = std::min(angular_limit, kMinimumLoadedAngularSpeed);
       }
-      double angular = std::copysign(
-        std::min(angular_limit,
-        std::sqrt(2.0 * params_->max_angular_accel * std::abs(remaining_))), remaining_);
-      angular = std::clamp(angular,
-        velocity.angular.z - params_->max_angular_accel * control_duration_,
-        velocity.angular.z + params_->max_angular_accel * control_duration_);
-      // Keep an exact zero at completion and a reliable active-turn floor.
-      angular = std::copysign(
-        std::max(std::abs(angular), kMinimumLoadedAngularSpeed), angular);
+      const double angular = boundedLoadedTurnCommand(remaining_, velocity.angular.z,
+        angular_limit, kMinimumLoadedAngularSpeed, params_->max_angular_accel, control_duration_);
       if (collision_checker_->isCollisionImminent(pose, 0.0, angular, 0.0)) {
         rotation_blocked_ = true;
         throw nav2_core::NoValidControl("Rotation command collision check failed");
@@ -511,6 +528,7 @@ private:
     });
   }
   bool turning_{false};
+  bool turning_to_goal_{false};
   bool short_reverse_plan_{false};
   bool aligning_terminal_yaw_{false};
   bool terminal_arrival_seen_{false};
