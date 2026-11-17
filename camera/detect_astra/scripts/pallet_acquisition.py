@@ -19,13 +19,19 @@ def valid_target(msg, now_s):
 
 class AcquisitionSession:
     MIN_SECONDS = 3.0
+    # One missed 1-Hz neural inference must not discard two good independent
+    # classifications of the same tracked pallet. This is semantic identity
+    # only; every result is fresh when admitted and metric RGB-D gates below
+    # remain separate. The total evidence window is bounded to five seconds.
+    MAX_DETECTION_GAP_S = 2.5
+    SEMANTIC_WINDOW_S = 5.0
     # Minimum observation span is a quality gate, never an acquisition deadline.
     MAX_SECONDS = None
 
     def __init__(self, seed_age_s=1.0):
         self.seed_age_s = seed_age_s
         # Must be set only by a separately validated calibration/accuracy gate.
-        # The current ROS pipeline has no such proof, so stay acquiring.
+        # Semantic confirmation can stop YOLO, but cannot establish accuracy.
         self.accuracy_validated = False
         self.session = 0
         self.started = None
@@ -66,9 +72,12 @@ class AcquisitionSession:
             a, b = bbox, previous[2]
             intersection = max(0., min(a[2],b[2])-max(a[0],b[0])) * max(0., min(a[3],b[3])-max(a[1],b[1]))
             union = (a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-intersection
-            if label != previous[3] or stamp-previous[0] > 1.5 or intersection/union < .5:
+            if (label != previous[3] or stamp-previous[0] > self.MAX_DETECTION_GAP_S
+                    or intersection/union < .5):
                 self.detections.clear()
         self.detections.append((stamp, wall, tuple(bbox), label))
+        while self.detections and stamp-self.detections[0][0] > self.SEMANTIC_WINDOW_S:
+            self.detections.popleft()
 
     def target(self, stamp, wall, ros, valid, x=0., y=0., heading=0., lost=False):
         if self.started_ros is None or stamp < self.started_ros:
@@ -107,7 +116,11 @@ class AcquisitionSession:
         elapsed = wall-self.started
         semantic = (len(self.detections) >= 3 and wall-self.detections[-1][1] <= 1.0
                     and -.05 <= ros-self.detections[-1][0] <= self.seed_age_s)
-        if elapsed >= self.MIN_SECONDS and semantic and self.measurement_ready(wall, ros):
+        # Gather geometry after semantic acquisition has released the neural
+        # worker. Requiring the RGB-D window here kept YOLO running whenever
+        # its CPU/transport load interrupted that very window. Pausing does
+        # not lock a target: VERIFYING_RGBD still needs fresh geometry.
+        if elapsed >= self.MIN_SECONDS and semantic:
             self.phase, self.locked = 'STOPPING_YOLO', False
             self.reason = 'Đang chờ inference kết thúc và heartbeat YOLO tắt'
             return True
@@ -139,4 +152,5 @@ class AcquisitionSession:
                     reason=self.reason, elapsed_s=max(0., wall-self.started) if self.started is not None else 0.,
                     min_seconds=self.MIN_SECONDS, max_seconds=self.MAX_SECONDS,
                     detections=len(self.detections), target_samples=len(self.targets),
+                    semantic_capture_stamps_s=[d[0] for d in self.detections],
                     accuracy_validated=self.accuracy_validated)

@@ -15,6 +15,7 @@ goal_file=''
 global_localization=0
 localization_only=0
 camera_obstacles=0
+pickup=0
 while [[ $# -gt 0 ]]; do
 case "$1" in
   --capture-only) capture_only=1; shift ;;
@@ -31,8 +32,9 @@ case "$1" in
   --global-localization) global_localization=1; localization=amcl; shift ;;
   --localization-only) localization_only=1; localization=amcl; shift ;;
   --camera-obstacles) camera_obstacles=1; shift ;;
+  --pickup) pickup=1; shift ;;
   --help|-h)
-    echo 'Usage: bash simulation/run_r3_live_trial.sh [--capture-only | --localization-only] [--localization amcl|odom] [--localization-timeout SECONDS] [--map ABS.yaml] [--initial-pose X Y YAW_DEG] [--rviz] [--nav-to-a | --nav-check-only | --recognize-here | --save-a] [--a-file NEW.json] [--global-localization]'
+    echo 'Usage: bash simulation/run_r3_live_trial.sh [--capture-only | --localization-only] [--localization amcl|odom] [--localization-timeout SECONDS] [--map ABS.yaml] [--initial-pose X Y YAW_DEG] [--rviz] [--nav-to-a | --nav-check-only | --recognize-here | --save-a] [--pickup] [--a-file NEW.json] [--global-localization]'
     echo '--capture-only: chốt RGB-D và lưu bằng chứng; không khởi chạy bộ bám quỹ đạo.'
     echo 'Mặc định: AMCL định vị LiDAR + bản đồ chỉnh sửa; tự tìm toàn bản đồ nếu không có initial-pose/RViz. Dùng --localization odom để chạy theo odom cũ.'
     echo '--localization-timeout: tối đa 120 giây mặc định để định vị trước khi đo/chạy; hết hạn sẽ dừng an toàn.'
@@ -42,10 +44,14 @@ case "$1" in
     echo '--recognize-here: định vị LiDAR/bản đồ tại chỗ, bỏ bước Nav2 tới A; đo pallet theo tư thế thực tế rồi hỏi Enter trước khi chạy tới C. Có thể thêm --capture-only để chỉ đo và lưu.'
     echo '--localization-only: LiDAR + AMCL + camera vật cản + global/local costmap + kiểm tra A tại chỗ; Ctrl+C để đóng.'
     echo '--camera-obstacles: thêm dữ liệu camera vật cản để xem RViz trong lượt thử (không bật YOLO).'
+    echo '--pickup: sau Nav2 tới A (hoặc recognize-here), HOME càng, nhận diện, chạy liên tục A→C→B rồi nâng 8 cm; cần firmware HOME 1 mm mới.'
     exit 0 ;;
   *) echo "Tham số không hỗ trợ: $1" >&2; exit 2 ;;
 esac
 done
+[[ $pickup -eq 0 || ( ( $nav_to_a -eq 1 || $recognize_here -eq 1 ) && $nav_check_only -eq 0 && $localization_only -eq 0 && $capture_only -eq 0 && $save_a -eq 0 ) ]] || {
+  echo '--pickup cần --nav-to-a hoặc --recognize-here, không dùng với chế độ chỉ kiểm tra/đo/lưu A.' >&2; exit 2;
+}
 [[ $localization_only -eq 0 || ( $nav_to_a -eq 0 && $recognize_here -eq 0 && $save_a -eq 0 && $capture_only -eq 0 ) ]] || {
   echo '--localization-only không kết hợp với nav-to-a/recognize-here/save-a/capture-only' >&2; exit 2;
 }
@@ -150,6 +156,20 @@ stop_owned() {
   wait "$pid" 2>/dev/null || true
 }
 
+start_perception() {
+  if [[ -n "$perception_pid" ]] && kill -0 "$perception_pid" 2>/dev/null; then
+    return 0
+  fi
+  echo 'Nạp sẵn model YOLO; nhận diện và tracking đang tạm dừng tới khi xe ở A.'
+  setsid bash camera/detect_astra/scripts/open_pallet_target.sh \
+    --model camera/detect_astra/data/runtime_models/best_v3_ncnn_model \
+    --measurement-bias-yaml camera/detect_astra/config/calibration/pallet_target_bias_robot_2026_11_11.yaml \
+    --measurement-evidence-dir "$run_dir/camera_evidence" \
+    --heading-floor-reference --start-paused --max-fps 1 --track-max-fps 8 \
+    --preview-fps 2 --cpu-threads 2 >>"$run_dir/perception.log" 2>&1 &
+  perception_pid=$!
+}
+
 start_navigation() {
   local attempt
   for attempt in 1 2 3; do
@@ -207,6 +227,9 @@ localization_nodes_running() {
 cleanup() {
   local result=$?
   trap - EXIT
+  if [[ $pickup -eq 1 && -n "$bringup_pid" ]]; then
+    python3 simulation/r3_lift_control.py stop --execute >"$run_dir/lift_stop.log" 2>&1 || true
+  fi
   stop_owned "$global_initializer_pid"
   stop_owned "$safety_pid"
   stop_owned "$navigation_pid"
@@ -230,7 +253,7 @@ cleanup() {
         -f "$run_dir/trial/mission_result.json" ]]; then
     if camera/detect_astra/.venv/bin/python simulation/r3_render_real_result.py \
        --plan "$plan" --trial "$run_dir/trial" \
-       --output "$run_dir/trajectory_result.png"; then
+       --output "$run_dir/trajectory_result.png" --view laptop; then
       echo "Ảnh ba quỹ đạo: $run_dir/trajectory_result.png"
     else
       echo 'Không vẽ được ảnh từ log odom; xem các tệp trong thư mục lượt chạy.' >&2
@@ -418,6 +441,10 @@ if [[ $save_a -eq 1 ]]; then
   exit 0
 fi
 
+if [[ $nav_check_only -eq 0 ]]; then
+  start_perception
+fi
+
 if [[ $nav_to_a -eq 1 ]]; then
   echo "Nav2 sẽ đi tới A mới trong: $goal_file"
   if [[ $nav_check_only -eq 0 ]]; then
@@ -477,27 +504,43 @@ if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
   fi
 fi
 
-echo 'Mở YOLO và node đo pallet RGB-D...'
-setsid bash camera/detect_astra/scripts/open_pallet_target.sh \
-  --model camera/detect_astra/data/runtime_models/best_v3_ncnn_model \
-  --measurement-bias-yaml camera/detect_astra/config/calibration/pallet_target_bias_robot_2026_11_11.yaml \
-  --measurement-evidence-dir "$run_dir/camera_evidence" \
-  --heading-floor-reference --max-fps 1 --track-max-fps 8 --preview-fps 2 --cpu-threads 2 >"$run_dir/perception.log" 2>&1 &
-perception_pid=$!
+if [[ $pickup -eq 1 ]]; then
+  python3 simulation/r3_lift_control.py home --execute 2>&1 | tee "$run_dir/lift_home.log"
+fi
+
+echo 'Bắt đầu nhận diện YOLO và đo pallet RGB-D mới tại A...'
+start_perception
+perception_restarts=0
 
 while true; do
   kill -0 "$bringup_pid" 2>/dev/null || { echo 'Bringup đã dừng; xem bringup.log' >&2; exit 1; }
-  kill -0 "$perception_pid" 2>/dev/null || { echo 'Nhận diện đã dừng; xem perception.log' >&2; exit 1; }
-  python3 simulation/r3_perception_switch.py recognize --wait-timeout 120
-  if python3 simulation/r3_live_prepare.py --output "$run_dir/plan" --timeout 0 --localization "$localization"; then
-    break
-  else
-    prepare_rc=$?
-    if [[ $prepare_rc -ne 3 ]]; then
+  prepare_rc=4
+  if kill -0 "$perception_pid" 2>/dev/null \
+      && python3 simulation/r3_perception_switch.py recognize --wait-timeout 20; then
+    if python3 simulation/r3_live_prepare.py --output "$run_dir/plan" --timeout 30 --localization "$localization"; then
+      break
+    else
+      prepare_rc=$?
+    fi
+  fi
+  if [[ $prepare_rc -eq 3 ]]; then
+    echo 'RGB-D mất dấu trước khi khóa đích; bắt đầu phiên YOLO mới, xe vẫn đứng yên.'
+    sleep .2
+  elif [[ $prepare_rc -eq 5 ]]; then
+    echo 'Đã nhận diện được pallet nhưng chưa có quỹ đạo hợp lệ; xem PLAN_BLOCKED phía trên. Không khởi động lại YOLO vì lỗi lập đường.' >&2
+    exit "$prepare_rc"
+  elif [[ $prepare_rc -eq 2 || $prepare_rc -eq 4 ]]; then
+    if [[ $perception_restarts -ge 2 ]]; then
+      echo "Nhận diện chưa khôi phục sau 2 lần mở lại; xe đứng yên. Xem $run_dir/perception.log." >&2
       exit "$prepare_rc"
     fi
-    echo 'RGB-D mất dấu trước khi khóa đích; bật lại YOLO và đo mới, xe vẫn đứng yên.'
-    sleep .5
+    perception_restarts=$((perception_restarts + 1))
+    echo "Khởi động lại phần nhận diện tại A ($perception_restarts/2); giữ camera, bản đồ và vị trí xe."
+    stop_owned "$perception_pid"
+    perception_pid=''
+    start_perception
+  else
+    exit "$prepare_rc"
   fi
 done
 python3 simulation/r3_real_preflight.py --plan "$plan" --allow-provisional
@@ -518,15 +561,17 @@ if [[ $capture_only -eq 1 ]]; then
   exit 0
 fi
 
-setsid ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" \
+setsid ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$run_dir" \
   >"$run_dir/safety.log" 2>&1 &
 safety_pid=$!
 sleep 2
 kill -0 "$safety_pid" 2>/dev/null || { echo 'Bộ dừng vật cản đã dừng; xem safety.log' >&2; exit 1; }
 
+trial_mode=(--arrive-at-c)
+[[ $pickup -eq 0 ]] || trial_mode=(--pickup)
 set +e
 python3 simulation/r3_real_trial.py --plan "$plan" --output "$run_dir/trial" \
-  --allow-provisional --execute --arrive-at-c 2>&1 | tee "$run_dir/trial.log"
+  --allow-provisional --execute "${trial_mode[@]}" 2>&1 | tee "$run_dir/trial.log"
 trial_rc=${PIPESTATUS[0]}
 set -e
 [[ $trial_rc -eq 0 ]] || exit "$trial_rc"
@@ -536,7 +581,9 @@ if [[ ! -f "$run_dir/trial/mission_result.json" ]]; then
 fi
 mission_status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
   "$run_dir/trial/mission_result.json")
-if [[ "$mission_status" == C_ARRIVED ]]; then
+if [[ "$mission_status" == PICKUP_COMPLETE ]]; then
+  echo 'Đã chạy A→C→B, dừng bánh tại B và nâng càng lên 8 cm theo phản hồi ESP32.'
+elif [[ "$mission_status" == C_ARRIVED ]]; then
   echo 'Đã hoàn thành A→C và dừng tại C; chưa đưa càng vào hoặc nâng pallet.'
 elif [[ "$mission_status" == C_ALIGNMENT_WARNING ]]; then
   echo 'Đã đi hết đoạn A→C và dừng; còn sai số tại C được ghi trong c_arrival, không tự xoay chỉnh thêm.'

@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -78,6 +79,78 @@ class ControlOdomGuard:
         self.applied_correction=None
         self.target_correction=None
         self.last_output_capture=None
+        self.insertion_lock=None
+        self.insertion_pending=None
+        self.insertion_capture_target=None
+
+    def lock_for_insertion(self,request,now):
+        """Hold the current frame, or slew to the plan's camera-capture frame.
+
+        The optional capture target is immutable for this request/plan. It
+        never changes the current output immediately, and an acknowledgement
+        is withheld until fresh captures have completed the normal slew.
+        """
+        if (not isinstance(request,dict) or request.get('action')!='lock_for_insertion'
+                or not self.fresh(request.get('published_ros_s'),now,1.)
+                or not isinstance(request.get('plan_id'),str) or len(request['plan_id'])!=64):
+            raise ValueError('invalid/stale insertion frame request')
+        if self.expected is None or any(request.get(k)!=self.expected[k]
+                                       for k in ('run_id','map_file','baseline_map_odom')):
+            raise ValueError('insertion lock belongs to a different localization session/map')
+        capture=(pose_value(request['capture_correction_xyyaw'])
+                 if 'capture_correction_xyyaw' in request else None)
+        if self.insertion_lock is not None:
+            if request['plan_id']!=self.insertion_lock['plan_id']:
+                raise ValueError('insertion frame is already held by another plan')
+            if capture is not None and capture!=self.insertion_capture_target:
+                raise ValueError('insertion capture frame changed after confirmation')
+            return self.insertion_lock
+        if (self.fault or not self.raw_valid or self.reference_state is None
+                or self.applied_correction is None
+                or not self.fresh(self.last_output_capture,now,ODOM_MAX_AGE_S)):
+            raise ValueError('fresh validated EKF control frame required before insertion lock')
+        if self.insertion_pending is not None:
+            if (request['plan_id']!=self.insertion_pending['plan_id']
+                    or capture!=self.insertion_capture_target):
+                raise ValueError('pending insertion plan/capture frame changed')
+            return dict(self.insertion_pending)
+        if capture is not None:
+            if (math.dist(capture[:2],self.applied_correction[:2])>.15
+                    or abs(wrap(capture[2]-self.applied_correction[2]))>math.radians(5.)):
+                raise ValueError('insertion capture frame exceeds 15 cm / 5 deg settling bounds')
+            self.insertion_capture_target=capture
+            self.target_correction=capture
+            self.insertion_pending=dict(ready=False,plan_id=request['plan_id'],
+                run_id=self.expected['run_id'],map_file=self.expected['map_file'],
+                capture_correction_xyyaw=list(capture),requested_at_ros_s=now)
+            self.mode='insertion_frame_settling'
+            self.update_issue='settling the shared odom/LiDAR frame to camera capture at A'
+            if self.applied_correction!=capture:
+                return dict(self.insertion_pending)
+        return self._confirm_insertion_lock(request,now)
+
+    def _confirm_insertion_lock(self,request,now):
+        self.insertion_lock=dict(ready=True,plan_id=request['plan_id'],
+            run_id=self.expected['run_id'],map_file=self.expected['map_file'],
+            correction_xyyaw=list(self.applied_correction),
+            locked_at_ros_s=now,locked_capture_stamp_s=self.last_output_capture)
+        if self.insertion_capture_target is not None:
+            self.insertion_lock['capture_correction_xyyaw']=list(self.insertion_capture_target)
+        self.insertion_pending=None
+        self.target_correction=self.applied_correction
+        self.mode='insertion_locked_ekf'
+        return self.insertion_lock
+
+    def _slew_correction(self,target,stamp):
+        """Apply the same bounded interpolation to AMCL and capture targets."""
+        dt=max(0.,min(.1,stamp-self.last_output_capture))
+        current=self.applied_correction
+        dx,dy=target[0]-current[0],target[1]-current[1]
+        scale=min(1.,.03*dt/max(math.hypot(dx,dy),1e-12))
+        delta=wrap(target[2]-current[2])
+        angle=max(-math.radians(.5)*dt,min(math.radians(.5)*dt,delta))
+        self.applied_correction=(current[0]+scale*dx,current[1]+scale*dy,
+            target[2] if abs(delta)<=math.radians(.5)*dt else wrap(current[2]+angle))
 
     def transform(self,status,message,now):
         """Keep control on fresh EKF; adopt only validated AMCL updates."""
@@ -113,6 +186,32 @@ class ControlOdomGuard:
             if status.get('role') not in (None,'trial') or status.get('external_control_odom') is False:
                 self.fault='control odom publisher ownership changed'
                 raise ValueError(self.fault)
+        if self.insertion_lock is not None:
+            # Global AMCL remains available for observation. Its later changes
+            # cannot turn a fork already entering the frozen pallet corridor.
+            self.mode='insertion_locked_ekf'
+            self.update_issue='AMCL frame updates deferred during C-to-B insertion'
+            self.target_correction=self.applied_correction=tuple(self.insertion_lock['correction_xyyaw'])
+            self.last_output_capture=stamp
+            self.reference_state['correction_xyyaw']=list(self.applied_correction)
+            output=self._apply(self.reference_state,message,raw)
+            self.raw_valid=True
+            return output
+        if self.insertion_pending is not None:
+            # The frozen RGB-D target and both pose consumers must agree
+            # before heading alignment. Ignore new global corrections during
+            # this bounded return; each output still uses its true EKF stamp.
+            self.target_correction=self.insertion_capture_target
+            self._slew_correction(self.target_correction,stamp)
+            self.mode='insertion_frame_settling'
+            self.last_output_capture=stamp
+            if (math.dist(self.applied_correction[:2],self.target_correction[:2])<=1e-12
+                    and abs(wrap(self.applied_correction[2]-self.target_correction[2]))<=1e-12):
+                self._confirm_insertion_lock(self.insertion_pending,now)
+            self.reference_state['correction_xyyaw']=list(self.applied_correction)
+            output=self._apply(self.reference_state,message,raw)
+            self.raw_valid=True
+            return output
         try:
             candidate=ControlOdomGuard(self.map_file)
             candidate.expected=self.expected
@@ -133,12 +232,7 @@ class ControlOdomGuard:
         if self.applied_correction is None:
             self.applied_correction=self.target_correction
         else:
-            dt=max(0.,min(.1,stamp-self.last_output_capture))
-            current,target=self.applied_correction,self.target_correction
-            dx,dy=target[0]-current[0],target[1]-current[1]
-            scale=min(1.,.03*dt/max(math.hypot(dx,dy),1e-12))
-            angle=max(-math.radians(.5)*dt,min(math.radians(.5)*dt,wrap(target[2]-current[2])))
-            self.applied_correction=(current[0]+scale*dx,current[1]+scale*dy,wrap(current[2]+angle))
+            self._slew_correction(self.target_correction,stamp)
         self.last_output_capture=stamp
         self.reference_state['correction_xyyaw']=list(self.applied_correction)
         output=self._apply(self.reference_state,message,raw)
@@ -274,19 +368,31 @@ class ControlOdomNode(Node):
     def __init__(self,map_file,*,context=None):
         super().__init__('r3_control_odom',context=context)
         self.guard=ControlOdomGuard(map_file)
+        self.control_stream_id=str(uuid.uuid4())
         self.state=None
         self.reason='waiting for localization trial handoff and fresh EKF'
         self.count=0
         self.last_output_stamp=None
         self.last_output_wall=None
         self.maximum_output_gap_s=0.
+        self.insertion_lock_issue=''
         self.output=self.create_publisher(Odometry,'/pallet/r3/localized_odom',qos_profile_sensor_data)
         reliable=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,
                            reliability=ReliabilityPolicy.RELIABLE)
         self.health=self.create_publisher(String,'/pallet/r3/control_odom/status',reliable)
         self.create_subscription(String,'/pallet/r3/localization/status',self.on_state,reliable)
+        self.create_subscription(String,'/pallet/r3/control_odom/insertion_request',self.on_insertion_request,reliable)
         self.create_subscription(Odometry,'/odom',self.on_odom,qos_profile_sensor_data)
         self.create_timer(.05,self.publish_health)
+
+    def on_insertion_request(self,message):
+        try:
+            self.guard.lock_for_insertion(json.loads(message.data),
+                self.get_clock().now().nanoseconds*1e-9)
+            self.insertion_lock_issue=''
+            self.publish_health()
+        except (ValueError,TypeError,KeyError) as exc:
+            self.insertion_lock_issue=str(exc)
 
     def on_state(self,message):
         try:
@@ -319,6 +425,10 @@ class ControlOdomNode(Node):
         self.last_output_wall=wall
         self.reason=('AMCL update delayed/rejected; continuing in the locked trial frame with fresh EKF'
                      if self.guard.mode=='ekf_tracking' else
+                     'insertion frame held; fresh EKF/IMU tracks the straight C-to-B segment'
+                     if self.guard.mode=='insertion_locked_ekf' else
+                     'settling shared odom/LiDAR frame to the camera capture at A'
+                     if self.guard.mode=='insertion_frame_settling' else
                      'fresh EKF sample transformed with a validated AMCL correction')
 
     def publish_health(self):
@@ -326,6 +436,7 @@ class ControlOdomNode(Node):
         ready=bool(self.guard.reference_state is not None and self.guard.raw_valid and not self.guard.fault
                    and self.last_output_stamp is not None and -.05<=now-self.last_output_stamp<=ODOM_MAX_AGE_S)
         state=dict(published_ros_s=now,ready=ready,output_samples=self.count,reason=self.guard.fault or self.reason,
+            integrity_fault=self.guard.fault,control_stream_id=self.control_stream_id,
             latest_output_capture_stamp_s=self.last_output_stamp,
             output_capture_age_s=(now-self.last_output_stamp if self.last_output_stamp is not None else None),
             supervisor_validation_age_s=(now-self.state['published_ros_s']
@@ -333,6 +444,8 @@ class ControlOdomNode(Node):
             maximum_output_gap_s=self.maximum_output_gap_s,original_capture_stamp_preserved=True,
             control_status_topic='/pallet/r3/control_odom/status',control_mode=self.guard.mode,
             amcl_update_issue=self.guard.update_issue,amcl_update_validated=self.guard.mode=='amcl_corrected_ekf',
+            insertion_lock=self.guard.insertion_lock,insertion_lock_issue=self.insertion_lock_issue,
+            insertion_pending=self.guard.insertion_pending,
             covariance_is_accuracy_proof=False)
         reference=self.guard.reference_state
         if reference is not None:

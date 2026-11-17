@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -11,8 +12,9 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import Twist,TwistStamped,PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu,LaserScan
 from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
 
 
 def finite(value):
@@ -24,7 +26,8 @@ class NavigationTelemetry(Node):
         super().__init__('r3_navigation_telemetry')
         output.parent.mkdir(parents=True,exist_ok=True)
         self.file=output.open('w',buffering=65536);self.latest={};self.ticks=0
-        self.file.write(json.dumps(dict(schema='r3_navigation_motion_v1',
+        self.last_record_at=time.monotonic()
+        self.file.write(json.dumps(dict(schema='r3_navigation_motion_v2',
             observer_only=True,robot_commands_from_this_process=0))+'\n')
         for topic in ['/cmd_vel_nav','/cmd_vel_nav_checked','/cmd_vel_smoothed','/cmd_vel_safe']:
             self.create_subscription(Twist,topic,
@@ -36,6 +39,13 @@ class NavigationTelemetry(Node):
                 lambda m,t=topic:self.odometry(t,m),qos_profile_sensor_data)
         self.create_subscription(Imu,'/imu',self.imu,qos_profile_sensor_data)
         self.create_subscription(PoseWithCovarianceStamped,'/amcl_pose',self.amcl,qos_profile_sensor_data)
+        # Capture both ends of the filter and the actual TF edge stamps. An
+        # AMCL pose callback delayed in another process cannot establish
+        # whether LiDAR delivery, AMCL processing or that observer was late.
+        for topic in ('/scan','/scan_filtered'):
+            self.create_subscription(LaserScan,topic,
+                lambda m,t=topic:self.scan(t,m),qos_profile_sensor_data)
+        self.create_subscription(TFMessage,'/tf',self.transforms,qos_profile_sensor_data)
         self.create_subscription(String, '/pallet/r3/localization/status', self.localization,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_timer(.05,self.record)
@@ -49,15 +59,28 @@ class NavigationTelemetry(Node):
             vx=finite(msg.linear.x),wz=finite(msg.angular.z))
     def odometry(self,topic,msg):
         p=msg.pose.pose;t=msg.twist.twist
-        self.latest[topic]=dict(stamp_ros_s=self.stamp(msg),x=finite(p.position.x),
+        self.latest[topic]=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),x=finite(p.position.x),
             y=finite(p.position.y),yaw=self.yaw(p.orientation),vx=finite(t.linear.x),wz=finite(t.angular.z))
     def imu(self,msg):
-        self.latest['/imu']=dict(stamp_ros_s=self.stamp(msg),yaw=self.yaw(msg.orientation),
+        self.latest['/imu']=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),yaw=self.yaw(msg.orientation),
             wz=finite(msg.angular_velocity.z))
     def amcl(self,msg):
         p=msg.pose.pose
-        self.latest['/amcl_pose']=dict(stamp_ros_s=self.stamp(msg),x=finite(p.position.x),
+        self.latest['/amcl_pose']=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),x=finite(p.position.x),
             y=finite(p.position.y),yaw=self.yaw(p.orientation))
+    def scan(self,topic,msg):
+        self.latest[topic]=dict(received_ros_s=self.now(),stamp_ros_s=self.stamp(msg),
+            frame_id=msg.header.frame_id,beam_count=len(msg.ranges),scan_time_s=finite(msg.scan_time))
+    def transforms(self,msg):
+        received=self.now()
+        for transform in msg.transforms:
+            edge=(transform.header.frame_id,transform.child_frame_id)
+            if edge not in (('map','odom'),('odom','base_footprint')):
+                continue
+            t=transform.transform
+            self.latest['tf:'+edge[0]+'->'+edge[1]]=dict(received_ros_s=received,
+                stamp_ros_s=self.stamp(transform),x=finite(t.translation.x),y=finite(t.translation.y),
+                yaw=self.yaw(t.rotation),stamp_includes_amcl_tolerance=edge==('map','odom'))
     def localization(self,msg):
         try:
             value=json.loads(msg.data)
@@ -67,7 +90,10 @@ class NavigationTelemetry(Node):
         except (ValueError, TypeError, AttributeError):
             pass
     def record(self):
-        self.file.write(json.dumps(dict(ros_s=self.now(),**self.latest),allow_nan=False)+'\n')
+        wall=time.monotonic()
+        self.file.write(json.dumps(dict(ros_s=self.now(),
+            observer_period_s=wall-self.last_record_at,**self.latest),allow_nan=False)+'\n')
+        self.last_record_at=wall
         self.ticks+=1
         if self.ticks%20==0:self.file.flush()
 

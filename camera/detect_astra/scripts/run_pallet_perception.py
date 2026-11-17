@@ -24,7 +24,9 @@ def main():
                    'GOMP_SPINCOUNT': '0'}
             children.append(subprocess.Popen(
                 [sys.executable, str(Path(__file__).with_name(name)), *sys.argv[1:]],
-                start_new_session=True, env=env))
+                # Remain in the launcher's owned process group: a bounded
+                # restart must also reap a detector stuck in native inference.
+                env=env))
         while not stopped.wait(.2):
             exited = next((child for child in children if child.poll() is not None), None)
             if exited is not None:
@@ -33,7 +35,10 @@ def main():
     finally:
         for child in children:
             if child.poll() is None:
-                child.send_signal(signal.SIGINT)
+                # The owned process group may already have received SIGINT.
+                # SIGTERM requests ROS shutdown without injecting a second
+                # KeyboardInterrupt into a child's cleanup code.
+                child.send_signal(signal.SIGTERM)
         for child in children:
             try:
                 child.wait(timeout=6)

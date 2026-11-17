@@ -1,6 +1,10 @@
 # Applied by stationary_inspection or precision_localization launch profiles.
 # A product likelihood gives one-scan evidence without repeated parked updates.
 # Beam skipping reduces the influence of objects absent from the saved map.
+# Leave CPU headroom for odometry, Nav2 and RGB-D on the Pi. A 2000-particle
+# floor with 120 beams queues scans under contention, delaying map -> odom.
+# Global scan initialization and the independent localization gates still
+# qualify the pose; particle count alone is not an accuracy guarantee.
 amcl:
   ros__parameters:
     laser_model_type: likelihood_field_prob
@@ -11,6 +15,6 @@ amcl:
     beam_skip_distance: 0.25
     beam_skip_threshold: 0.30
     beam_skip_error_threshold: 0.90
-    max_beams: 120
-    min_particles: 2000
-    max_particles: 4000
+    max_beams: 90
+    min_particles: 500
+    max_particles: 2000

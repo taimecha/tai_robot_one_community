@@ -1,5 +1,0 @@
-#!/usr/bin/env python3
-'PLAN CONTRACT ONLY — no ROS or motor implementation.\nRead KE_HOACH_CODEX.md (r3-approved-lattice) and QUYET_DINH_DA_CHOT.md first.\nINPUT: measured target with frame/feature/applied_bias and calibration hash;\nT_base_camera_optical, T_base_fork_root, valid odom at capture time.\nConfirmed housing->fork lateral difference is -20mm in BASE-axis Y; do not assume housing equals base or optical.\nMap optical target exactly once; existing corrected base scalars use a separate\nexplicit adapter. Camera principal point cx/cy is not a housing/robot origin.\nFor every pose: p_F=p_B+R(theta_B)*r_BF; theta_F=theta_B+psi_BF.\nTarget F: front-entry-center -0.020*n, yaw=n; goal base subtracts rotated r_BF.\nPlanner/follower/plots use identical transform hashes. GT must not enter runtime.\nOUTPUT: measured immutable odom target, base goal, fork goal, geometry hash.\nUnconfirmed transforms -> SPEC_INCOMPLETE, not a fake path. No automatic fallback.\n'
-
-if __name__ == "__main__":
-    print(__doc__)

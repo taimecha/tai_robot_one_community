@@ -1,13 +1,12 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robot">
 
-    <!-- Simulation is the current default.  A real-hardware launch can set
-         use_sim:=false and provide its serial SystemInterface plugin name. -->
-    <xacro:arg name="use_sim" default="true"/>
+    <!-- Default to the serial hardware used by the real robot. -->
+    <xacro:arg name="use_sim" default="false"/>
     <xacro:arg name="hardware_plugin"
-               default="gz_ros2_control/GazeboSimSystem"/>
+               default="tai_robot_one/TaiRobotSerialSystem"/>
     <xacro:arg name="controllers_file"
-               default="$(find tai_robot_one)/config/ros2_controllers.yaml"/>
+               default="$(find tai_robot_one)/config/ros2_controllers_real.yaml"/>
     <xacro:arg name="sim_camera_width" default="160"/>
     <xacro:arg name="sim_camera_height" default="120"/>
     <xacro:arg name="sim_camera_rate" default="10"/>

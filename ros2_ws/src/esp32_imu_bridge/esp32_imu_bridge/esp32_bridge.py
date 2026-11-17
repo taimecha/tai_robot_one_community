@@ -18,6 +18,11 @@ from serial import SerialException
 from std_msgs.msg import Empty, Float64MultiArray, String
 
 
+LIFT_FIRMWARE_PROFILE = 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3'
+LIFT_INFO_QUERY_INTERVAL_S = 1.0
+LIFT_INFO_MAX_ATTEMPTS = 8
+
+
 class FrameError(ValueError):
     """Raised when a complete serial record is not a valid IMU frame."""
 
@@ -64,10 +69,12 @@ class ESP32ImuBridge(Node):
             Float64MultiArray,
             '/lift_controller/commands',
             self.lift_command_callback,
-            10,
+            1,
         )
         self.lift_home_subscription = self.create_subscription(
-            Empty, '/lift/home', self.lift_home_callback, 10)
+            Empty, '/lift/home', self.lift_home_callback, 1)
+        self.lift_stop_subscription = self.create_subscription(
+            Empty, '/lift/stop', self.lift_stop_callback, 1)
         self.serial_port = None
         self.receive_buffer = bytearray()
         self.last_connect_attempt = 0.0
@@ -80,12 +87,21 @@ class ESP32ImuBridge(Node):
         self.lift_home_seen_running = False
         self.lift_home_requested_at = 0.0
         self.lift_homed = False
+        self.lift_home_generation = 0
+        self.lift_home_requested_generation = 0
         self.lift_command_quiet_required = True
+        self.lift_firmware_profile = None
+        self.lift_info_query_attempts = 0
+        self.lift_info_last_query = None
+        self.lift_info_timeout_logged = False
         self.last_lift_command_received = 0.0
         # ESP32 sends IMU frames at 50 Hz. Poll at 100 Hz; the buffered reader
         # still drains every complete frame with at most 10 ms receive delay.
         self.create_timer(0.01, self.poll_serial)
         self.create_timer(0.1, self.send_lift_heartbeat)
+        # Poll faster than the rate cap: a timer callback a fraction early
+        # must not turn a one-second retry into a two-second retry.
+        self.create_timer(0.1, self.query_lift_firmware)
         self.get_logger().info(
             f'IMU bridge configured: {self.port} at {self.baud} baud -> '
             f'{topic}')
@@ -104,7 +120,9 @@ class ESP32ImuBridge(Node):
         self.lift_home_active = False
         self.lift_home_seen_running = False
         self.lift_homed = False
+        self.lift_home_generation = 0
         self.lift_command_quiet_required = True
+        self.reset_lift_firmware_query()
         if rclpy.ok():
             self.publish_lift_status(serial_connected=False)
 
@@ -123,10 +141,42 @@ class ESP32ImuBridge(Node):
             )
             self.serial_port.reset_input_buffer()
             self.get_logger().info(f'Connected to IMU on {self.port}')
-            self.publish_lift_status(serial_connected=True)
+            self.reset_lift_firmware_query()
+            self.query_lift_firmware()
+            if self.serial_port is not None:
+                self.publish_lift_status(serial_connected=True)
         except (SerialException, OSError) as error:
             self.serial_port = None
             self.log_throttled('warning', f'Cannot open {self.port}: {error}')
+
+    def reset_lift_firmware_query(self):
+        self.lift_firmware_profile = None
+        self.lift_info_query_attempts = 0
+        self.lift_info_last_query = None
+        self.lift_info_timeout_logged = False
+
+    def query_lift_firmware(self):
+        """Retry a read-only identity query if an ESP32 startup reply was lost.
+
+        A known profile, including an incompatible one, ends the query. This
+        never emits HOME, SET, a heartbeat, or a reset; the lift's compatibility
+        and fresh-telemetry checks still decide whether motion is permitted.
+        """
+        if self.serial_port is None or self.lift_firmware_profile is not None:
+            return
+        now = time.monotonic()
+        if (self.lift_info_last_query is not None
+                and now-self.lift_info_last_query < LIFT_INFO_QUERY_INTERVAL_S):
+            return
+        if self.lift_info_query_attempts >= LIFT_INFO_MAX_ATTEMPTS:
+            if not self.lift_info_timeout_logged:
+                self.get_logger().warning('Lift firmware identity not received after '
+                    f'{LIFT_INFO_MAX_ATTEMPTS} LIFT,INFO queries; HOME remains blocked')
+                self.lift_info_timeout_logged = True
+            return
+        self.lift_info_query_attempts += 1
+        self.lift_info_last_query = now
+        self.send_serial_line('LIFT,INFO')
 
     def log_throttled(self, level, message):
         """Avoid filling logs when a cable is absent or data is malformed."""
@@ -164,13 +214,21 @@ class ESP32ImuBridge(Node):
                 'Lift HOME accepted; waiting for a new position command')
 
     def lift_home_callback(self, _message):
-        """HOME means seek the physical lower switch; it never assigns zero."""
+        """Firmware checks the bottom switch and owns the physical zero."""
         if self.send_serial_line('LIFT,HOME'):
             self.lift_home_active = True
             self.lift_home_seen_running = False
+            self.lift_home_requested_generation = self.lift_home_generation
             self.lift_home_requested_at = time.monotonic()
         else:
             self.log_throttled('warning', 'Cannot HOME: ESP32 is disconnected')
+
+    def lift_stop_callback(self, _message):
+        """Cancel HOME heartbeats and a position move without redefining zero."""
+        self.lift_home_active = False
+        self.lift_command_quiet_required = True
+        self.last_lift_command_received = time.monotonic()
+        self.send_serial_line('LIFT,STOP')
 
     def lift_command_callback(self, message):
         """Forward one finite, mechanically bounded lift position target."""
@@ -195,13 +253,25 @@ class ESP32ImuBridge(Node):
     def publish_lift_status(self, **values):
         """Publish machine-readable state for teleop without a custom message."""
         message = String()
-        message.data = json.dumps(values, separators=(',', ':'))
+        message.data = json.dumps(dict(values,
+            published_ros_s=self.get_clock().now().nanoseconds*1e-9,
+            position_commands_ready=not self.lift_command_quiet_required,
+            firmware_profile=self.lift_firmware_profile,
+            firmware_info=dict(
+                state=('confirmed' if self.lift_firmware_profile == LIFT_FIRMWARE_PROFILE else
+                       'incompatible' if self.lift_firmware_profile is not None else
+                       'timeout' if self.lift_info_query_attempts >= LIFT_INFO_MAX_ATTEMPTS else
+                       'pending'),
+                query_attempts=self.lift_info_query_attempts,
+                max_attempts=LIFT_INFO_MAX_ATTEMPTS,
+                expected_profile=LIFT_FIRMWARE_PROFILE)), separators=(',', ':'))
         self.lift_status_publisher.publish(message)
 
     def parse_lift_frame(self, line):
-        """Validate LIFT protocol v1 telemetry from the combined firmware."""
+        """Validate old v1 and v2 telemetry with explicit HOME completion."""
         fields = line.split(',')
-        if len(fields) != 11 or fields[0:2] != ['LIFT', '1']:
+        v2 = len(fields) == 13 and fields[:2] == ['LIFT', '2']
+        if not v2 and (len(fields) != 11 or fields[0:2] != ['LIFT', '1']):
             raise FrameError('unsupported LIFT frame')
         try:
             sample_ms = int(fields[2])
@@ -218,10 +288,21 @@ class ESP32ImuBridge(Node):
         # Before the lower switch is found, AccelStepper's temporary coordinate
         # can be negative by as much as the full homing travel. It is not yet a
         # physical ROS position and is clamped to zero when published.
-        if not -0.60 <= position <= 0.53 or not 0.0 <= target <= 0.52:
+        target_min = 0.0 if homed else -0.60
+        if not -0.60 <= position <= 0.53 or not target_min <= target <= 0.52:
             raise FrameError('LIFT position outside physical bounds')
         if fields[3] not in ('UNHOMED', 'IDLE', 'MOVING', 'HOMING', 'FAULT'):
             raise FrameError('unknown LIFT state')
+        generation = None
+        skipped = None
+        if v2:
+            try:
+                generation = int(fields[11])
+                skipped = int(fields[12])
+            except ValueError as error:
+                raise FrameError('invalid LIFT home acknowledgement') from error
+            if not 0 <= generation <= 0xFFFFFFFF or skipped not in (0, 1):
+                raise FrameError('LIFT home acknowledgement outside bounds')
         return {
             'sample_ms': sample_ms,
             'state': fields[3],
@@ -232,24 +313,30 @@ class ESP32ImuBridge(Node):
             'lower_active': bool(lower_active),
             'upper_active': bool(upper_active),
             'fault': fields[10],
+            'home_completion_count': generation,
+            'home_skipped_active': bool(skipped) if skipped is not None else None,
         }
 
     def publish_lift_frame(self, frame):
         """Publish lift feedback for RViz and state for the control UI."""
         was_homed = self.lift_homed
         self.lift_homed = frame['homed']
+        generation = frame.get('home_completion_count')
+        if generation is not None:
+            self.lift_home_generation = generation
         if self.lift_homed and not was_homed:
             self.lift_command_quiet_required = True
         if frame['state'] == 'HOMING':
             self.lift_home_seen_running = True
         if self.lift_home_active:
-            immediate_lower_home = frame['homed'] and frame['lower_active']
             completed_after_motion = (
                 self.lift_home_seen_running and frame['state'] != 'HOMING')
+            new_completion = (generation is not None and
+                0 < ((generation-self.lift_home_requested_generation) & 0xFFFFFFFF) < 0x80000000)
             rejected_or_timed_out = (
                 time.monotonic() - self.lift_home_requested_at > 61.0 or
                 frame['state'] == 'FAULT')
-            if immediate_lower_home or completed_after_motion or rejected_or_timed_out:
+            if completed_after_motion or new_completion or rejected_or_timed_out:
                 self.lift_home_active = False
         joint = JointState()
         joint.header.stamp = self.get_clock().now().to_msg()
@@ -389,7 +476,28 @@ class ESP32ImuBridge(Node):
             # Reset protocol state so sequence 1 from the new boot is valid.
             self.last_sequence = None
             self.last_sample_ms = None
+            self.lift_homed = False
+            self.lift_home_generation = 0
+            self.lift_home_active = False
+            self.lift_command_quiet_required = True
+            self.reset_lift_firmware_query()
+            self.publish_lift_status(serial_connected=True, state='UNHOMED', homed=False)
+            self.query_lift_firmware()
             self.log_throttled('info', f'ESP32: {line}')
+            return
+        if line.startswith('INFO,LIFT,'):
+            fields = line.split(',')
+            if (len(fields) != 3 or not 1 <= len(fields[2]) <= 80
+                    or any(c not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_' for c in fields[2])):
+                raise FrameError('invalid lift firmware identity')
+            profile = fields[2]
+            if profile != self.lift_firmware_profile:
+                if profile == LIFT_FIRMWARE_PROFILE:
+                    self.get_logger().info('Lift firmware confirmed: '+profile)
+                else:
+                    self.get_logger().warning('Incompatible lift firmware: '
+                        +profile+'; required '+LIFT_FIRMWARE_PROFILE)
+            self.lift_firmware_profile = profile
             return
         if line.startswith('STATUS:'):
             self.log_throttled('info', f'ESP32: {line}')
@@ -435,6 +543,9 @@ class ESP32ImuBridge(Node):
 
     def destroy_node(self):
         """Release the serial port before ROS destroys the node."""
+        self.lift_home_active = False
+        if self.serial_port is not None:
+            self.send_serial_line('LIFT,STOP')
         self.close_serial()
         return super().destroy_node()
 

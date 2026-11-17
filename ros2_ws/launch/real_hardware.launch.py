@@ -36,7 +36,7 @@ def generate_launch_description():
     ekf_file = os.path.join(package_share, 'config', 'ekf.yaml')
     imu_config = os.path.join(package_share, 'config', 'imu_bridge.yaml')
     rviz_config = os.path.join(
-        package_share, 'config', 'gazebo_robot.rviz')
+        package_share, 'config', 'robot_real.rviz')
 
     drive_port = LaunchConfiguration('drive_serial_port')
     lift_port = LaunchConfiguration('lift_serial_port')

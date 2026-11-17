@@ -31,6 +31,14 @@ if pgrep -f 'astra_camera_node( |$)' >/dev/null; then
   exit 1
 fi
 
+# UVC publishes RGB directly in its capture callback. A synchronous DDS write
+# to a slow network reader can stall acquisition itself, leaving >500 ms RGB
+# gaps even while Depth continues. Scope asynchronous transport to this
+# camera process; image stamps, calibration and freshness checks stay intact.
+if [[ ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp} == rmw_fastrtps_cpp ]]; then
+  export RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS
+fi
+
 exec ros2 launch astra_camera astra_pro.launch.xml \
   depth_registration:=true \
   enable_color:=true \

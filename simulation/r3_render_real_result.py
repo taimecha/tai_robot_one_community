@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render three odom-frame trajectories after an r3 real trial has ended."""
+"""Compare planned and recorded base/fork poses using one consistent frame."""
 import argparse
 import csv
 import json
@@ -36,7 +36,25 @@ def configure_view(ax, view):
     ax.set_ylabel(f'Y ngang pallet (m) · {direction}')
 
 
-def render(plan_path, trial_dir, output, view='laptop'):
+def execution_poses(rows, target, pose_source='encoder'):
+    """Keep XY and yaw from the same estimator, with a single A reference."""
+    if pose_source not in ('encoder', 'control'):
+        raise ValueError('pose_source must be encoder or control')
+    control = [(float(row['x_m']), float(row['y_m']),
+                float(row.get('control_yaw_rad') or row['yaw_rad'])) for row in rows]
+    raw_keys = ('raw_odom_x_m', 'raw_odom_y_m', 'raw_odom_yaw_rad')
+    raw_available = all(all(row.get(key) not in (None, '') for key in raw_keys) for row in rows)
+    correction = (target.get('localization') or {}).get('correction_at_capture_xyyaw', (0., 0., 0.))
+    encoder = ([compose(correction, tuple(float(row[key]) for key in raw_keys)) for row in rows]
+               if raw_available else None)
+    if not all(math.isfinite(v) for poses in (control, encoder or []) for p in poses for v in p):
+        raise ValueError('executed odom contains nonfinite coordinates')
+    use_encoder = pose_source == 'encoder' and encoder is not None
+    return dict(selected=encoder if use_encoder else control, control=control, encoder=encoder,
+                source='encoder' if use_encoder else 'control')
+
+
+def render(plan_path, trial_dir, output, view='laptop', pose_source='encoder'):
     saved = json.loads(plan_path.read_text())
     plan = FrozenPlan(**{key: saved[key] for key in
                          ('target_json', 'geometry_json', 'phases_json', 'config_json')})
@@ -49,31 +67,29 @@ def render(plan_path, trial_dir, output, view='laptop'):
     if not rows:
         raise ValueError('no executed odom samples; cannot draw the third trajectory')
     geometry = json.loads(plan.geometry_json)
-    target = json.loads(plan.target_json)['pose']
+    target_data = json.loads(plan.target_json)
+    target = target_data['pose']
     phases = json.loads(plan.phases_json)
     approach_only = (mission.get('execution_mode') == 'arrive_at_c'
                      or mission.get('status') in ('C_ARRIVED', 'C_ALIGNMENT_WARNING'))
     displayed_phases = phases[:1] if approach_only else phases
     planned_base = [tuple(p) for phase in displayed_phases for p in phase['poses']]
     planned_fork = [fork_for_base(p, geometry) for p in planned_base]
-    odom = [(float(row['x_m']), float(row['y_m'])) for row in rows]
-    final_odom_yaw = float(rows[-1]['yaw_rad'])
-    final_imu_yaw = float(rows[-1].get('imu_control_yaw_rad') or final_odom_yaw)
-    final_control_yaw = float(rows[-1].get('control_yaw_rad') or final_imu_yaw)
-    amcl_control = rows[-1].get('heading_source') == 'amcl_odom_ekf'
-    odom_control = rows[-1].get('heading_source') == 'odom_ekf'
-    heading_label = 'AMCL + odom EKF' if amcl_control else ('odom EKF' if odom_control else 'IMU')
-    final_pose = (float(rows[-1]['x_m']), float(rows[-1]['y_m']), final_control_yaw)
-    if (not all(math.isfinite(v) for p in odom for v in p)
-            or not all(math.isfinite(v) for v in (final_odom_yaw, final_imu_yaw, final_control_yaw))):
-        raise ValueError('executed odom contains nonfinite coordinates')
+    execution = execution_poses(rows, target_data, pose_source)
+    odom = execution['selected']
+    executed_fork = [fork_for_base(p, geometry) for p in odom]
+    final_pose = odom[-1]
+    final_control_yaw = execution['control'][-1][2]
+    heading_label = ('encoder + IMU, gắn mốc A' if execution['source'] == 'encoder'
+                     else 'ước lượng điều khiển')
 
-    # All three paths and all shapes use one rigid view transform. In this
+    # All paths and all shapes use one rigid view transform. In this
     # frame the pallet is level and the initial robot carries the yaw error.
     planned_base_xy = [pallet_view(p, target) for p in planned_base]
     planned_fork_xy = [pallet_view(p, target) for p in planned_fork]
     odom_xy = [pallet_view(p, target) for p in odom]
-    fig = Figure(figsize=(11, 5.2), facecolor='white')
+    executed_fork_xy = [pallet_view(p, target) for p in executed_fork]
+    fig = Figure(figsize=(12, 6), facecolor='white')
     ax = fig.subplots()
     ax.set_facecolor('#f8fafc')
     deck = [pallet_view(p, target) for p in rectangle(target, (0., geometry['pallet_length'],
@@ -95,7 +111,7 @@ def render(plan_path, trial_dir, output, view='laptop'):
     final_body_xy = [pallet_view(p, target) for p in final_body]
     ax.add_patch(Polygon(final_body_xy, facecolor='none', edgecolor='#b45309',
                          linestyle='--', linewidth=2, zorder=5,
-                         label=f'Ước lượng cuối · odom XY + góc {heading_label}'))
+                         label=f'Tư thế cuối ước lượng · {heading_label}'))
     final_tine_xy = []
     for tine in final_tines:
         points = [pallet_view(p, target) for p in tine]
@@ -110,13 +126,15 @@ def render(plan_path, trial_dir, output, view='laptop'):
     ax.plot([p[0] for p in odom_xy], [p[1] for p in odom_xy],
             color='#f59e0b', linewidth=2.2, linestyle='--',
             marker='o' if len(odom) == 1 else None,
-            label=('AMCL + odom · tâm xe' if amcl_control else 'Odom ghi khi chạy · tâm xe'), zorder=4)
-    if amcl_control:
-        capture_correction = json.loads(plan.target_json)['localization']['correction_at_capture_xyyaw']
-        raw_xy = [pallet_view(compose(capture_correction,
-                  (float(row['raw_odom_x_m']),float(row['raw_odom_y_m']),0.)), target) for row in rows]
-        ax.plot([p[0] for p in raw_xy],[p[1] for p in raw_xy],color='#64748b',linewidth=1.4,
-                linestyle=':',label='Odom encoder + IMU · gắn mốc A',zorder=3)
+            label='Ghi khi chạy · tâm odom', zorder=4)
+    ax.plot([p[0] for p in executed_fork_xy], [p[1] for p in executed_fork_xy],
+            color='#0f766e', linewidth=2.2, linestyle='-.',
+            label='Ghi khi chạy · tâm gốc càng', zorder=4)
+    if execution['source'] == 'encoder' and target_data.get('localization'):
+        control_xy = [pallet_view(p, target) for p in execution['control']]
+        ax.plot([p[0] for p in control_xy], [p[1] for p in control_xy],
+                color='#64748b', linewidth=1.3, linestyle=':',
+                label='Ước lượng điều khiển có hiệu chỉnh AMCL', zorder=3)
 
     a, c, b = planned_base[0], phases[0]['poses'][-1], phases[-1]['poses'][-1]
     waypoints = (('A', a), ('C', c)) if approach_only else (('A', a), ('C', c), ('B', b))
@@ -129,6 +147,12 @@ def render(plan_path, trial_dir, output, view='laptop'):
                edgecolor='white', linewidth=1, zorder=7)
     ax.annotate('Odom cuối', odom_xy[-1], xytext=(9, -17), textcoords='offset points',
                 fontsize=9, color='#92400e')
+    fork_xy = executed_fork_xy[-1]
+    ax.scatter(*fork_xy, s=38, facecolor='#0f766e', edgecolor='white', zorder=7)
+    ax.plot([odom_xy[-1][0], fork_xy[0]], [odom_xy[-1][1], fork_xy[1]],
+            color='#b45309', linewidth=1.2, zorder=5)
+    ax.annotate('Gốc càng cuối', fork_xy, xytext=(-10, -29), textcoords='offset points',
+                ha='right', fontsize=9, color='#0f766e')
     ax.annotate('Pallet', pallet_view(target, target), xytext=(8, 10), textcoords='offset points',
                 fontsize=10, color='#065f46')
     a_xy = pallet_view(a, target)
@@ -137,7 +161,7 @@ def render(plan_path, trial_dir, output, view='laptop'):
              head_width=.025, head_length=.035, color='#475569', zorder=5,
              length_includes_head=True)
 
-    all_xy = [*planned_base_xy, *planned_fork_xy, *odom_xy, *deck, *body_xy,
+    all_xy = [*planned_base_xy, *planned_fork_xy, *odom_xy, *executed_fork_xy, *deck, *body_xy,
               *final_body_xy, *final_tine_xy]
     ax.set_xlim(min(p[0] for p in all_xy)-.18, max(p[0] for p in all_xy)+.18)
     ax.set_ylim(min(p[1] for p in all_xy)-.18, max(p[1] for p in all_xy)+.18)
@@ -150,25 +174,27 @@ def render(plan_path, trial_dir, output, view='laptop'):
     initial_yaw = math.degrees(a_yaw)
     final_error = errors(final_pose, target, geometry)
     final_yaw = math.degrees(final_error['yaw_error_rad'])
-    control_turn = math.degrees(wrap(final_control_yaw-a[2]))
-    odom_final_yaw = math.degrees(wrap(final_odom_yaw-target[2]))
+    control_yaw_error = math.degrees(wrap(final_control_yaw-target[2]))
     tip_clearance_cm = 100*(final_error['gap_m']-geometry['fork_length'])
-    status_label = ('ĐÃ TỚI C' if status == 'C_ARRIVED' else
+    tip_label = (f'độ sâu chèn ước tính {-tip_clearance_cm:.1f} cm' if tip_clearance_cm < 0
+                 else f'đầu càng còn cách pallet {tip_clearance_cm:.1f} cm')
+    status_label = ('ĐÃ TỚI B · CÀNG NÂNG 8 CM' if status == 'PICKUP_COMPLETE' else
+                    'ĐÃ TỚI C' if status == 'C_ARRIVED' else
                     'ĐÃ HẾT A→C · CÒN SAI SỐ C' if status == 'C_ALIGNMENT_WARNING' else
                     'ĐÃ DỪNG TRƯỚC C' if status == 'C_DIAGNOSTIC_DONE' else status)
-    view_label = 'GÓC NHÌN LAPTOP' if view == 'laptop' else 'GÓC NHÌN ROS'
+    view_label = 'GÓC NHÌN LAPTOP · Y DƯƠNG XUỐNG' if view == 'laptop' else 'Y DƯƠNG LÊN'
     path_label = 'A → C' if approach_only else 'A → C → B'
     ax.set_title(f'SƠ ĐỒ ƯỚC LƯỢNG {path_label} · {status_label} · {view_label}\n'
-                 f'Pallet: RGB-D khóa tại A  |  Xe: odom X/Y + góc {heading_label}  |  '
+                 f'Pallet: RGB-D khóa tại A  |  Xe: {heading_label}  |  '
                  'không đo lại pallet lúc dừng\n'
-                 f'Góc camera tại A {initial_yaw:+.2f}° + quay {heading_label} {control_turn:+.2f}° '
-                 f'= góc cuối ước lượng {final_yaw:+.2f}°\n'
-                 f'Odom cuối {odom_final_yaw:+.2f}° · đầu càng ước tính còn '
-                 f'{tip_clearance_cm:.1f} cm · {len(odom)} mẫu', fontsize=10)
+                 f'Góc tại A {initial_yaw:+.2f}° · góc cuối ước lượng {final_yaw:+.2f}° '
+                 f'(điều khiển {control_yaw_error:+.2f}°) · {tip_label}\n'
+                 f'Tâm odom → gốc càng: {geometry["base_fork"][0]*100:.2f} cm dọc xe '
+                 f'· {len(odom)} mẫu', fontsize=9.5)
     # Show the signed estimate explicitly. This is a heading vector, never a
     # physical measurement inferred from the operator's photograph.
     final_xy = odom_xy[-1]
-    final_display_yaw = wrap(final_control_yaw-target[2])
+    final_display_yaw = wrap(final_pose[2]-target[2])
     ax.annotate('', xy=(final_xy[0]+.30*math.cos(final_display_yaw),
                         final_xy[1]+.30*math.sin(final_display_yaw)),
                 xytext=final_xy, arrowprops=dict(arrowstyle='->', color='#b45309', lw=2),
@@ -186,7 +212,10 @@ def render(plan_path, trial_dir, output, view='laptop'):
     fig.savefig(output.with_suffix('.svg'))
     return {'status': status, 'image': str(output),
             'svg': str(output.with_suffix('.svg')),
-            'odom_samples': len(odom), 'plan_id': plan.plan_id, 'view': view}
+            'odom_samples': len(odom), 'plan_id': plan.plan_id, 'view': view,
+            'pose_source': execution['source'], 'final_yaw_error_deg': final_yaw,
+            'final_control_yaw_error_deg': control_yaw_error,
+            'physical_pose_independently_measured': False}
 
 
 def main():
@@ -195,9 +224,11 @@ def main():
     parser.add_argument('--trial', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--view', choices=('laptop', 'ros'), default='laptop',
-                        help='laptop reflects Y for the operator viewpoint; ROS data stays unchanged')
+                        help='ros keeps positive Y up; laptop reflects the entire drawing')
+    parser.add_argument('--pose-source', choices=('encoder', 'control'), default='encoder',
+                        help='encoder keeps XY and yaw anchored to A; control includes applied map corrections')
     args = parser.parse_args()
-    result = render(args.plan, args.trial, args.output, args.view)
+    result = render(args.plan, args.trial, args.output, args.view, args.pose_source)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

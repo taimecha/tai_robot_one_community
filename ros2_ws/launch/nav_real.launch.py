@@ -43,22 +43,12 @@ def _validate_arguments(context):
 
 def _nav2_actions(context, nav2_share, params_file):
     map_file = LaunchConfiguration('map_file').perform(context)
-    test_rewrites = {}
-    if LaunchConfiguration('motion_test').perform(context).lower() == 'true':
-        test_rewrites = {
-            'bt_navigator.ros__parameters.default_nav_to_pose_bt_xml': os.path.join(
-                get_package_share_directory('nav2_bt_navigator'), 'behavior_trees',
-                'navigate_w_replanning_only_if_path_becomes_invalid.xml'),
-            'controller_server.ros__parameters.FollowPath.min_approach_linear_velocity': '0.12',
-            'controller_server.ros__parameters.FollowPath.regulated_linear_scaling_min_speed': '0.12',
-        }
     configured_params = RewrittenYaml(
         source_file=params_file,
         param_rewrites={
             'bt_navigator.ros__parameters.default_nav_to_pose_bt_xml': os.path.join(
                 get_package_share_directory('tai_robot_one'), 'behavior_trees',
                 'navigate_real_clearance_escape.xml'),
-            **test_rewrites,
             'use_sim_time': 'false',
             'yaml_filename': map_file,
             'set_initial_pose': 'false',
@@ -241,10 +231,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': False,
-            'global_path_topic': PythonExpression([
-                "'/plan' if '", LaunchConfiguration('motion_test'),
-                "'.lower() in ('1', 'true', 'yes', 'on') else '/plan_selected'",
-            ]),
+            'global_path_topic': '/plan_selected',
         }],
         condition=IfCondition(LaunchConfiguration('start_navigation')),
     )
@@ -300,9 +287,6 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'restore_saved_pose', default_value='true',
             description='Restore and persist the last AMCL pose'),
-        DeclareLaunchArgument(
-            'motion_test', default_value='false', choices=['true', 'false'],
-            description='Single-goal diagnostic without automatic motion recovery'),
         DeclareLaunchArgument(
             'localization_delay', default_value='8.0',
             description='Seconds to wait for hardware and sensors'),

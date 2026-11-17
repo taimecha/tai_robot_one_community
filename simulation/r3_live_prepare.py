@@ -5,7 +5,7 @@ This process has no command publisher. It records the measured camera result,
 the odom pose at capture, and the assumptions used for the first supervised run.
 """
 import argparse
-from collections import deque
+from collections import Counter, deque
 import json
 import math
 from pathlib import Path
@@ -24,8 +24,8 @@ from detected_pallets_interfaces.msg import PalletTarget
 from r3_core import (R3_PLANNED_C_CLEARANCE_M, FrozenPlan, PlanReferenceError,
                      compose, dense, digest, errors, fork_for_base, goal_base,
                      validate_phases, validate_plan_reference, wrap)
-from r3_refine_approach import minimum_jerk_approach
-from r3_sim import simulate, write_csv
+from r3_approach_planner import minimum_jerk_approach
+from r3_tracking import predict_tracking, write_csv
 from r3_localization_contract import checked_status
 
 
@@ -39,7 +39,7 @@ HEADING_PATTERN = re.compile(r'(?:^|; )heading_source=floor_referenced_plane; '
 
 def provisional_geometry():
     """Use documented robot dimensions without falsely calling them surveyed."""
-    geometry = json.loads((ROOT / 'simulation/r3/fixture.json').read_text())
+    geometry = json.loads((ROOT / 'simulation/r3/robot_geometry.json').read_text())
     geometry.update(provenance='USER_ACCEPTED_APPROXIMATE_REAL_TRIAL',
                     confirmed_real_geometry=False,
                     approximate_real_trial=True,
@@ -158,6 +158,26 @@ def reacquire_needed(status):
             and 'RGB-D mất dấu' in status.get('reason', ''))
 
 
+def perception_stall(status, now_ros, receive_age, elapsed):
+    """Recover a stuck pre-motion detector; never extend image/pose freshness."""
+    if elapsed < 5.:
+        return None
+    if not status or receive_age > 3.:
+        return 'YOLO recognition heartbeat unavailable for more than 3 seconds'
+    published = status.get('published_ros_s')
+    if published is not None and not -.05 <= now_ros-published <= 3.:
+        return 'YOLO recognition heartbeat source is stale'
+    if status.get('busy') is True and status.get('inference_busy_s', 0.) > 5.:
+        return 'YOLO inference has not finished for more than 5 seconds'
+    if status.get('enabled') is True and 'rgb_receive_age_s' in status:
+        age = status['rgb_receive_age_s']
+        if age is None or age > 3.:
+            return 'YOLO is enabled but receives no fresh camera RGB stream'
+        if status.get('inference_attempts') == 0 and status.get('elapsed_s', 0.) > 8.:
+            return 'YOLO receives RGB but has not started inference'
+    return None
+
+
 def build_plan(snapshot, start, geometry, output):
     # An invalid coordinate contract is independent of curve shape or camera
     # noise. Reject it before the expensive four-candidate refinement search.
@@ -168,10 +188,15 @@ def build_plan(snapshot, start, geometry, output):
         raise ValueError('START_TOO_CLOSE_FOR_C: đầu càng đang quá gần pallet; '
                          'đưa xe lùi về A để còn khoảng A→C trước khi thử lại')
     attempts = []
-    # Finish the bend well before C. The real robot brakes 5 cm before C;
-    # without a straight lead-in it was still correcting yaw while braking.
-    straight_lead_in_m = .12
-    for extra in (R3_PLANNED_C_CLEARANCE_M, .20, .25, .30):
+    # Prefer 2.5 seconds of straight heading feedback before C. At an A pose
+    # accepted within 10 cm, a fixed 25 cm lead can leave too little curved
+    # approach to remove the lateral error within the turning-radius limit.
+    # Keep the longest feasible lead, with the previously supported 12 cm as
+    # the lower bound. Every candidate still passes the complete fork sweep
+    # and predicted-follower checks; C->B stays the same zero-heading line.
+    lead_candidates = (.25, .20, .15, .12)
+    for straight_lead_in_m, extra in ((lead, extra) for lead in lead_candidates
+            for extra in (R3_PLANNED_C_CLEARANCE_M, .20, .25, .30)):
         gap = geometry['fork_length'] + extra
         c = goal_base(target, geometry, gap)
         curve_end = goal_base(target, geometry, gap+straight_lead_in_m)
@@ -187,7 +212,7 @@ def build_plan(snapshot, start, geometry, output):
                       dict(type='STRAIGHT', stop_at_join=True,
                            poses=list(dense([c, b], step=.01)))]
             validate_phases(phases, target, geometry)
-            rows, follower = simulate(phases, target, geometry, start)
+            rows, follower = predict_tracking(phases, target, geometry, start)
             if follower.state != 'STOPPED' or abs(rows[-1]['ey_m']) > geometry['max_lateral']:
                 raise ValueError('predicted odom follower did not reach the lateral goal')
             config = dict(model='provisional_real_odom_trial',
@@ -195,6 +220,8 @@ def build_plan(snapshot, start, geometry, output):
                               method='bounded fork-root shape search on clamped quintic y(x)',
                               selected_C_unchanged=True, terminal_line_unchanged=True,
                               straight_lead_in_m=straight_lead_in_m,
+                              preferred_straight_lead_in_m=lead_candidates[0],
+                              minimum_straight_lead_in_m=lead_candidates[-1],
                               max_curvature_1pm=curvature, fork_overshoot_m=overshoot,
                               shape_coefficients=shape),
                           tracking_controller='curvature feedforward + odom heading and lateral feedback',
@@ -218,7 +245,7 @@ def build_plan(snapshot, start, geometry, output):
         except PlanReferenceError:
             raise
         except ValueError as exc:
-            attempts.append(f'C gap {gap:.3f} m: {exc}')
+            attempts.append(f'lead {straight_lead_in_m:.2f} m, C gap {gap:.3f} m: {exc}')
     raise ValueError('no feasible A→C→B path: ' + '; '.join(attempts))
 
 
@@ -262,6 +289,13 @@ class Capture(Node):
         self.status_wall = 0.
         self.odom = None
         self.odom_stamp = 0.
+        self.odom_history = deque(maxlen=64)
+        self.pending_targets = deque(maxlen=4)
+        self.capture_rejections = Counter()
+        self.capture_last_issue = ''
+        self.capture_accepted_samples = 0
+        self.localization_identity = None
+        self.control_localization_identity = None
         self.localization_mode = localization
         self.localization_status = None
         self.control_localization_status = None
@@ -283,6 +317,7 @@ class Capture(Node):
     def on_control_localization(self,msg):
         try:
             self.control_localization_status=checked_status(msg.data,self.get_clock().now().nanoseconds*1e-9)
+            self.observe_reference(self.control_localization_status, control=True)
         except (ValueError,TypeError,KeyError):
             self.control_localization_status=None
 
@@ -290,18 +325,42 @@ class Capture(Node):
         try:
             now = self.get_clock().now().nanoseconds*1e-9
             status = checked_status(msg.data, now)
-            if self.localization_status and status['run_id'] != self.localization_status['run_id']:
-                self.samples.clear()
+            self.observe_reference(status)
             self.localization_status = status
         except (ValueError, TypeError, KeyError):
             self.localization_status = None
             self.samples.clear()
+
+    def observe_reference(self, status, control=False):
+        """A map/run change invalidates capture-time pose witnesses too."""
+        identity = (status['run_id'], status['map_file'], tuple(status['baseline_map_odom']))
+        key = 'control_localization_identity' if control else 'localization_identity'
+        previous = getattr(self, key)
+        if previous is not None and previous != identity:
+            self.samples.clear()
+            self.pending_targets.clear()
+            self.odom_history.clear()
+            self.odom = None
+            self.odom_stamp = 0.
+            self.reject_capture('localization reference changed; awaiting new odom')
+        setattr(self, key, identity)
+
+    def reject_capture(self, reason):
+        self.capture_rejections[reason] += 1
+        self.capture_last_issue = reason
+
+    def capture_diagnostics(self):
+        return dict(accepted_samples=self.capture_accepted_samples,
+                    pending_targets=len(self.pending_targets),
+                    last_issue=self.capture_last_issue,
+                    rejections=dict(self.capture_rejections))
 
     def on_status(self, msg):
         try:
             status = json.loads(msg.data)
             if status.get('session') != (self.status or {}).get('session'):
                 self.samples.clear()
+                self.pending_targets.clear()
                 self.last_target_wall = 0.
                 self.yolo_off_wall = 0.
             if (status.get('yolo_stopped_ros_s') is not None
@@ -323,10 +382,57 @@ class Capture(Node):
                 or not all(math.isfinite(v) for v in (p.x, p.y, norm,
                     msg.twist.twist.linear.x, msg.twist.twist.angular.z))):
             self.odom = None
+            self.reject_capture('invalid or stale odom input')
+            return
+        if self.odom_history and stamp <= self.odom_history[-1][0]:
+            self.reject_capture('duplicate or out-of-order odom capture')
             return
         yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
         self.odom = (p.x, p.y, yaw, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
         self.odom_stamp = stamp
+        self.odom_history.append((stamp, self.odom))
+        while self.odom_history and stamp-self.odom_history[0][0] > 1.:
+            self.odom_history.popleft()
+        pending = sorted(self.pending_targets,
+            key=lambda target: target.header.stamp.sec+target.header.stamp.nanosec*1e-9)
+        self.pending_targets.clear()
+        for target in pending:
+            self.on_target(target)
+
+    def odom_at_capture(self, stamp):
+        """Pair a target to genuine pose captures within the existing 70 ms gate.
+
+        Camera processing can finish after newer odom has already arrived.
+        Interpolate only between close bracketing captures; otherwise retain
+        the nearest genuine sample and report its actual time offset.
+        """
+        history = list(self.odom_history)
+        if not history:
+            return None
+        before = next((item for item in reversed(history) if item[0] <= stamp), None)
+        after = next((item for item in history if item[0] >= stamp), None)
+        if before and after and stamp-before[0] <= .07+1e-9 and after[0]-stamp <= .07+1e-9:
+            span = after[0]-before[0]
+            fraction = (stamp-before[0])/span if span else 0.
+            a,b = before[1],after[1]
+            pose = tuple(a[i]+fraction*(b[i]-a[i]) if i != 2 else
+                         wrap(a[2]+fraction*wrap(b[2]-a[2])) for i in range(5))
+            return pose, dict(method='interpolated' if span else 'exact',
+                odom_capture_stamps_s=[before[0],after[0]],
+                maximum_capture_offset_s=max(stamp-before[0],after[0]-stamp)), (a,b)
+        nearest = min(history, key=lambda item: abs(item[0]-stamp))
+        if abs(nearest[0]-stamp) <= .07+1e-9:
+            return nearest[1], dict(method='nearest_capture',
+                odom_capture_stamps_s=[nearest[0]],
+                maximum_capture_offset_s=abs(nearest[0]-stamp)), (nearest[1],)
+        return None
+
+    def queue_target(self, msg):
+        stamp = msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
+        if all(stamp != old.header.stamp.sec+old.header.stamp.nanosec*1e-9
+               for old in self.pending_targets):
+            self.pending_targets.append(msg)
+        self.reject_capture('waiting for odom captured within 70 ms of target')
 
     def on_target(self, msg):
         s = self.status or {}
@@ -334,23 +440,47 @@ class Capture(Node):
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if s.get('enabled') is False and not msg.valid:
             self.samples.clear()
+            self.pending_targets.clear()
+            self.reject_capture('RGB-D became invalid after YOLO paused')
             return
-        if (time.monotonic()-self.status_wall > .5
-                or s.get('detections', 0) < 3
-                or (s.get('enabled') is False and s.get('busy') is True)
-                or s.get('enabled') not in (True, False)
-                or not msg.valid or msg.header.frame_id != 'camera_color_optical_frame'
-                or not -.05 <= now-stamp <= .25 or self.odom is None
-                or abs(stamp-self.odom_stamp) > .07
-                or abs(msg.rgb_depth_delta_ms) > 50
+        if time.monotonic()-self.status_wall > .5:
+            self.reject_capture('recognition status older than 500 ms')
+            return
+        if (s.get('detections', 0) < 3 or s.get('enabled') not in (True, False)
+                or (s.get('enabled') is False and s.get('busy') is True)):
+            self.reject_capture('waiting for semantic evidence or YOLO pause completion')
+            return
+        if not msg.valid or msg.header.frame_id != 'camera_color_optical_frame':
+            self.reject_capture('invalid RGB-D target or frame')
+            return
+        if not -.05 <= now-stamp <= .25:
+            self.reject_capture('RGB-D target capture older than 250 ms or future dated')
+            return
+        if isinstance(s.get('started_ros_s'), (int,float)) and stamp < s['started_ros_s']:
+            self.reject_capture('target belongs to an earlier recognition session')
+            return
+        if (not math.isfinite(msg.rgb_depth_delta_ms) or abs(msg.rgb_depth_delta_ms) > 50
                 or min(msg.left_depth_samples, msg.right_depth_samples) < 60
                 or not .172 <= msg.opening_width_m <= .332
-                or not .15 <= msg.leg_center_separation_m <= .60
-                or abs(self.odom[3]) > .005 or abs(self.odom[4]) > .01):
+                or not .15 <= msg.leg_center_separation_m <= .60):
+            self.reject_capture('RGB-D geometry, depth support or synchronization rejected')
+            return
+        if self.odom is None or not -.05 <= now-self.odom_stamp <= .2:
+            self.queue_target(msg)
+            return
+        paired = self.odom_at_capture(stamp)
+        if paired is None:
+            self.queue_target(msg)
+            return
+        capture_odom, pairing, witnesses = paired
+        if any(abs(odom[3]) > .005 or abs(odom[4]) > .01
+               for odom in (*witnesses, self.odom)):
+            self.reject_capture('robot moving at capture or at latest odom')
             return
         match = RAW_PATTERN.search(msg.status)
         heading_match = HEADING_PATTERN.search(msg.status)
         if not match or not heading_match:
+            self.reject_capture('missing shared calibration or floor-heading evidence')
             return
         raw, offset, corrected = map(float, match.groups())
         slope = float(heading_match.group(1))
@@ -359,8 +489,10 @@ class Capture(Node):
                 or not math.isfinite(slope)
                 or not all(math.isfinite(v) for v in (msg.chassis_front_forward_m,
                     msg.entry_heading_rad, raw, corrected))):
+            self.reject_capture('invalid shared depth or camera calibration evidence')
             return
         if self.samples and stamp <= self.samples[-1]['stamp']:
+            self.reject_capture('duplicate or out-of-order RGB-D capture')
             return
         if self.samples and stamp-self.samples[-1]['stamp'] > 1.0:
             self.samples.clear()
@@ -371,12 +503,17 @@ class Capture(Node):
             if value and math.isfinite(float(value.group(1))):
                 diagnostics[name] = float(value.group(1))
         diagnostics['depth_correction_shared'] = '; depth_correction_shared=true' in msg.status
-        self.samples.append(dict(stamp=stamp, odom=list(self.odom[:3]),
+        self.samples.append(dict(stamp=stamp, odom=list(capture_odom[:3]),
+            odom_pairing=pairing,
             forward=msg.chassis_front_forward_m+.3005,
             lateral=msg.opening_lateral_m, heading=msg.entry_heading_rad,
             raw=raw, heading_source='floor_referenced_plane',
             heading_depth_x_slope=slope, **diagnostics))
         self.last_target_wall = time.monotonic()
+        self.capture_accepted_samples += 1
+        self.capture_last_issue = ''
+        self.pending_targets = deque((target for target in self.pending_targets
+            if target.header.stamp.sec+target.header.stamp.nanosec*1e-9 > stamp), maxlen=4)
 
 
 def main():
@@ -392,11 +529,31 @@ def main():
     rclpy.init()
     node = Capture(args.localization)
     deadline = time.monotonic()+args.timeout if args.timeout else float('inf')
+    started_wall = time.monotonic()
+    last_progress_log = started_wall
     last_attempt = 0.
     last_error = ''
     try:
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=.05)
+            wall = time.monotonic()
+            now_ros = node.get_clock().now().nanoseconds*1e-9
+            issue = perception_stall(node.status, now_ros, wall-node.status_wall, wall-started_wall)
+            if issue:
+                print(json.dumps(dict(status='RESTART_PERCEPTION', reason=issue,
+                                      last_status=node.status, robot_commands=0),
+                                 ensure_ascii=False), flush=True)
+                return 4
+            if wall-last_progress_log >= 5.:
+                state = node.status or {}
+                print(json.dumps(dict(status='RECOGNIZING', phase=state.get('phase'),
+                    detections=state.get('detections', 0), rgbd_samples=len(node.samples),
+                    rgb_tracker_acknowledged=state.get('rgb_tracker_acknowledged'),
+                    rgb_tracker_issue=(state.get('rgb_tracker') or {}).get('issue'),
+                    inference_ms=state.get('inference_ms'), last_issue=state.get('last_issue', ''),
+                    capture=node.capture_diagnostics(),
+                    robot_commands=0), ensure_ascii=False), flush=True)
+                last_progress_log = wall
             # Allow brief tracking interruptions to recover. A lost seed with
             # no new valid measurement for two seconds starts a new session.
             if (time.monotonic()-node.status_wall <= .5
@@ -438,27 +595,39 @@ def main():
                     lateral_calibration=lateral_calibration)
                 if localization:
                     snapshot.update(frame_id='r3_trial', localization=localization)
+                print(json.dumps(dict(status='RGBD_READY_PLANNING',
+                    recognition_session=node.status.get('session'),
+                    recognition_elapsed_s=node.status.get('elapsed_s'),
+                    samples=len(samples),
+                    capture_age_ms=round((now_ros-samples[-1]['stamp'])*1000, 1),
+                    heading_deg=round(snapshot['measurement_report']['entry_heading_deg'], 2),
+                    robot_commands=0), ensure_ascii=False), flush=True)
+                planning_started_wall = time.monotonic()
                 plan, phases, rows = build_plan(snapshot, start, provisional_geometry(), args.output)
                 # A hash alone cannot reconstruct a wrong locked target.
                 # Preserve the actual accepted scalar captures and poses too.
                 (args.output/'capture_samples.json').write_text(json.dumps(
                     dict(samples=samples, recognition_session=node.status), indent=2))
             except PlanReferenceError as exc:
-                print(json.dumps(dict(status='BLOCKED',
+                print(json.dumps(dict(status='PLAN_BLOCKED',
                     reason='Invalid plan frame/reference: '+str(exc),
                     robot_commands=0), ensure_ascii=False), flush=True)
-                return 2
+                return 5
             except ValueError as exc:
-                if str(exc).startswith('START_TOO_CLOSE_FOR_C:'):
-                    print(json.dumps(dict(status='BLOCKED', reason=str(exc),
+                if str(exc).startswith(('START_TOO_CLOSE_FOR_C:', 'no feasible A→C→B path:')):
+                    # Planning failure is not a missing camera heartbeat.
+                    # Never loop back to its watchdog after a long search and
+                    # restart a detector which already provided valid data.
+                    print(json.dumps(dict(status='PLAN_BLOCKED', reason=str(exc),
                                           robot_commands=0), ensure_ascii=False), flush=True)
-                    return 2
+                    return 5
                 if str(exc) != last_error:
                     last_error = str(exc)
                     print('Chưa lập được quỹ đạo: ' + last_error, flush=True)
                 continue
             report = snapshot['measurement_report']
             print(json.dumps(dict(status='PLAN_READY', plan=str(args.output/'frozen_plan.json'),
+                planning_elapsed_s=round(time.monotonic()-planning_started_wall, 3),
                 preview=str(args.output/'trajectory.svg'),
                 plan_id=plan.plan_id, camera_raw_cm=round(report['camera_lateral_raw_m']*100, 2),
                 camera_correction_cm=2.5,
@@ -469,6 +638,7 @@ def main():
                 c_fork_tip_clearance_cm=round(
                     (errors(phases[1]['poses'][0], snapshot['pose'], provisional_geometry())['gap_m']
                      - provisional_geometry()['fork_length'])*100, 1),
+                straight_lead_in_cm=round(phases[0]['straight_lead_in_m']*100, 1),
                 heading_deg=round(report['entry_heading_deg'], 2),
                 heading_source=report['heading_source'],
                 heading_depth_x_slope=report['heading_depth_x_slope'],
@@ -476,6 +646,7 @@ def main():
             return 0
         print(json.dumps(dict(status='BLOCKED', reason='No fresh, stable post-YOLO RGB-D + stationary odom plan',
                               samples=len(node.samples), last_status=node.status,
+                              capture=node.capture_diagnostics(),
                               last_plan_error=last_error,
                               robot_commands=0), ensure_ascii=False))
         return 2

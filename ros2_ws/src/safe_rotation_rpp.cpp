@@ -1,8 +1,10 @@
 // Copyright 2026 TAI
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <stdexcept>
 
@@ -41,17 +43,24 @@ public:
     parameter("allow_short_rear_goal_correction", rclcpp::ParameterValue(false));
     parameter("allow_reverse_route_tracking", rclcpp::ParameterValue(true));
     parameter("terminal_reverse_speed", rclcpp::ParameterValue(0.08));
+    parameter("transient_tf_hold_timeout", rclcpp::ParameterValue(0.0));
     node->get_parameter(name + ".predictive_terminal_braking", predictive_terminal_braking_);
     node->get_parameter(name + ".terminal_command_latency", terminal_command_latency_);
     node->get_parameter(name + ".terminal_angular_deceleration", terminal_angular_deceleration_);
     node->get_parameter(name + ".allow_short_rear_goal_correction", allow_short_rear_goal_correction_);
     node->get_parameter(name + ".allow_reverse_route_tracking", allow_reverse_route_tracking_);
     node->get_parameter(name + ".terminal_reverse_speed", terminal_reverse_speed_);
+    node->get_parameter(name + ".transient_tf_hold_timeout", transient_tf_hold_timeout_);
     if (!std::isfinite(terminal_command_latency_) || terminal_command_latency_ < 0.0 ||
       !std::isfinite(terminal_angular_deceleration_) || terminal_angular_deceleration_ <= 0.0 ||
       !std::isfinite(terminal_reverse_speed_) || terminal_reverse_speed_ <= 0.0 || terminal_reverse_speed_ > .10)
     {
       throw std::invalid_argument("Invalid terminal braking or bounded reverse parameters");
+    }
+    if (!std::isfinite(transient_tf_hold_timeout_) ||
+      transient_tf_hold_timeout_ < 0.0 || transient_tf_hold_timeout_ > 1.0)
+    {
+      throw std::invalid_argument("Transient TF hold must be between zero and one second");
     }
     RCLCPP_INFO(logger_, "Terminal control: predictive braking=%d, latency budget=%.3f s, bounded rear goal=%d",
       predictive_terminal_braking_, terminal_command_latency_, allow_short_rear_goal_correction_);
@@ -61,6 +70,7 @@ public:
 
   void activate() override
   {
+    tf_hold_started_.reset();
     Base::activate();
     turn_limited_pub_->on_activate();
     publishTurnLimit();
@@ -124,6 +134,7 @@ public:
     // already-safe turn toward the same goal. That repeatedly changed the
     // heading target and led to back-and-forth turns near arrival.
     if (new_goal) {
+      tf_hold_started_.reset();
       turning_ = false;
       aligning_terminal_yaw_ = false;
       terminal_arrival_seen_ = false;
@@ -141,6 +152,39 @@ public:
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
     nav2_core::GoalChecker * goal_checker) override
+  {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+      auto command = computeWithCurrentTransforms(pose, velocity, goal_checker);
+      if (tf_hold_started_) {
+        RCLCPP_INFO(logger_, "TF recovered; continuing the same navigation goal");
+        tf_hold_started_.reset();
+      }
+      return command;
+    } catch (const nav2_core::ControllerTFError & error) {
+      if (transient_tf_hold_timeout_ <= 0.0 || cancelling_) {throw;}
+      if (!tf_hold_started_) {
+        tf_hold_started_ = started;
+        RCLCPP_WARN(logger_, "TF temporarily unavailable; commanding zero for at most %.2f s: %s",
+          transient_tf_hold_timeout_, error.what());
+      }
+      const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - *tf_hold_started_).count();
+      if (elapsed >= transient_tf_hold_timeout_) {throw;}
+      // Never reuse the preceding moving command, restamp a pose, extrapolate
+      // TF, or bypass footprint checks. Only a fully successful next compute
+      // may release this hold. Same-goal replans/reset do not reset its budget.
+      geometry_msgs::msg::TwistStamped stop;
+      stop.header = pose.header;
+      return stop;
+    }
+  }
+
+private:
+  geometry_msgs::msg::TwistStamped computeWithCurrentTransforms(
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & velocity,
+    nav2_core::GoalChecker * goal_checker)
   {
     if (cancelling_) {
       turning_ = false;
@@ -479,6 +523,8 @@ private:
   bool allow_short_rear_goal_correction_{false};
   bool allow_reverse_route_tracking_{true};
   double terminal_reverse_speed_{0.08};
+  double transient_tf_hold_timeout_{0.0};
+  std::optional<std::chrono::steady_clock::time_point> tf_hold_started_;
   bool rotation_blocked_{false};
   bool turn_limit_exceeded_{false};
   bool have_goal_{false};

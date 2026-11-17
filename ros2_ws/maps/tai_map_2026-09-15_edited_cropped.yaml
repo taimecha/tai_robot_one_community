@@ -1,7 +1,0 @@
-image: tai_map_2026-09-15_edited_cropped.pgm
-mode: trinary
-resolution: 0.050
-origin: [-4.061, -6.384, 0]
-negate: 0
-occupied_thresh: 0.65
-free_thresh: 0.196

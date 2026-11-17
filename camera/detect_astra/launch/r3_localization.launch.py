@@ -58,7 +58,10 @@ def localization_actions(context):
         Node(package='nav2_map_server', executable='map_server', name='map_server',
              output='screen', parameters=[str(config), {'yaml_filename': str(map_file)}]),
         Node(package='nav2_amcl', executable='amcl', name='amcl',
-             output='screen', parameters=amcl_parameters),
+             output='screen', parameters=amcl_parameters,
+             # Keep sensor processing independent of synchronous DDS writes
+             # to remote RViz readers. This node publishes no drive commands.
+             additional_env={'RMW_FASTRTPS_PUBLICATION_MODE': 'ASYNCHRONOUS'}),
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
              name='lifecycle_manager_localization', output='screen', parameters=[{
                  'use_sim_time': False, 'autostart': True,

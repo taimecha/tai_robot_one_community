@@ -3,7 +3,7 @@
 <package format="3">
   <name>tai_robot_one</name>
   <version>0.0.0</version>
-  <description>Simulation and ros2_control integration for the TAI four-wheel forklift robot.</description>
+  <description>Real hardware, localization and navigation for the TAI four-wheel forklift robot.</description>
   <maintainer email="my_email@email.com">TAI</maintainer>
   <license>Apache-2.0</license>
 
@@ -14,9 +14,6 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>std_msgs</depend>
-  <depend>gz_sim_vendor</depend>
-  <depend>gz_transport_vendor</depend>
-  <depend>gz_msgs_vendor</depend>
   <depend>behaviortree_cpp</depend>
   <depend>geometry_msgs</depend>
   <depend>nav2_regulated_pure_pursuit_controller</depend>
@@ -35,7 +32,6 @@
   <exec_depend>diff_drive_controller</exec_depend>
   <exec_depend>effort_controllers</exec_depend>
   <exec_depend>esp32_imu_bridge</exec_depend>
-  <exec_depend>gz_ros2_control</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>joint_state_publisher_gui</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
@@ -48,15 +44,13 @@
   <exec_depend>image_transport</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
-  <exec_depend>python3-tk</exec_depend>
   <exec_depend>python3-serial</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>position_controllers</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>rmw_fastrtps_cpp</exec_depend>
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
-  <exec_depend>ros_gz_bridge</exec_depend>
-  <exec_depend>ros_gz_sim</exec_depend>
   <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
@@ -66,12 +60,6 @@
   <exec_depend>topic_tools</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
-
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_cmake_gtest</test_depend>
-  <test_depend>python3-yaml</test_depend>
-  <test_depend>nlohmann_json</test_depend>
-  <test_depend>ament_lint_common</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

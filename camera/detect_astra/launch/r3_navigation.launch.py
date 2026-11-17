@@ -52,7 +52,8 @@ def navigation_parameters():
         regulated_linear_scaling_min_speed=.10,rotate_to_heading_angular_vel=.30,
         predictive_terminal_braking=True,terminal_command_latency=.25,
         terminal_angular_deceleration=1.5,allow_short_rear_goal_correction=True,
-        allow_reverse_route_tracking=False,terminal_reverse_speed=.10)
+        allow_reverse_route_tracking=False,terminal_reverse_speed=.10,
+        transient_tf_hold_timeout=.75)
     # Native Smac2D ends on a grid coordinate, which can differ from saved A.
     # Its opt-in wrapper collision-checks the short connector to exact A.
     planner=params['planner_server']['ros__parameters']

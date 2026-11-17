@@ -46,8 +46,7 @@ constexpr uint32_t LIFT_HOME_TIMEOUT_MS = 60000;
 constexpr uint32_t LIFT_HOME_UPPER_RELEASE_TIMEOUT_MS = 750;
 constexpr long LIFT_HOME_SETTLE_STEPS = LIFT_STEPS_PER_M / 1000L;  // 1 mm
 constexpr uint32_t LIFT_HOME_SETTLE_TIMEOUT_MS = 1000;
-constexpr uint32_t LIFT_HOME_LOWER_RELEASE_TIMEOUT_MS = 5000;
-constexpr long LIFT_HOME_LOWER_RELEASE_MAX_STEPS = LIFT_STEPS_PER_M / 40L; // 25 mm
+constexpr uint32_t LIFT_HOME_INPUT_CHECK_TIMEOUT_MS = 1000;
 static_assert(LIFT_STEPS_PER_M % 1000L == 0, "1mm must map to whole steps");
 constexpr uint32_t LIFT_TELEMETRY_INTERVAL_MS = 100;
 
@@ -64,13 +63,15 @@ DebouncedLimit lowerLimit{LOWER_LIMIT_PIN, false, false, 0};
 DebouncedLimit upperLimit{UPPER_LIMIT_PIN, false, false, 0};
 
 enum class LiftMode : uint8_t { UNHOMED, IDLE, MOVING, HOMING, FAULT };
-enum class LiftHomeStage : uint8_t { NONE, RELEASE_LOWER, SEEK_LOWER, HOME_SETTLE };
+enum class LiftHomeStage : uint8_t { NONE, CHECK_LOWER, SEEK_LOWER, HOME_SETTLE };
 LiftHomeStage liftHomeStage = LiftHomeStage::NONE;
 long liftHomeStageStartSteps = 0;
 uint32_t liftHomeStageStartedMs = 0;
 
 LiftMode liftMode = LiftMode::UNHOMED;
 bool liftHomed = false;
+uint32_t liftHomeCompletionCount = 0;
+bool liftHomeSkippedActive = false;
 bool liftHomeLeavingUpper = false;
 long liftTargetSteps = 0;
 uint32_t liftHomeStartedMs = 0;
@@ -95,12 +96,14 @@ struct LiftSnapshot {
   float speedStepsPerSecond;
   bool lowerActive;
   bool upperActive;
+  uint32_t homeCompletionCount;
+  bool homeSkippedActive;
   char fault[28];
 };
 
 QueueHandle_t liftCommandQueue = nullptr;
 LiftSnapshot sharedLift{
-  LiftMode::UNHOMED, false, 0, 0, 0.0f, false, false, "NONE"
+  LiftMode::UNHOMED, false, 0, 0, 0.0f, false, false, 0, false, "NONE"
 };
 portMUX_TYPE liftSnapshotMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -162,11 +165,13 @@ void setLiftFault(const char *fault) {
   Serial.printf("EVENT,LIFT_FAULT,%s\n", liftFault);
 }
 
-void acceptLowerHome() {
+void acceptLowerHome(bool alreadyActive = false) {
   liftStepper.setCurrentPosition(0);
   liftTargetSteps = 0;
   liftStepper.moveTo(0);
   liftHomed = true;
+  ++liftHomeCompletionCount;
+  liftHomeSkippedActive = alreadyActive;
   liftHomeLeavingUpper = false;
   liftHomeStage = LiftHomeStage::NONE;
   liftMode = LiftMode::IDLE;
@@ -175,6 +180,8 @@ void acceptLowerHome() {
 }
 
 void startLiftHome(uint32_t nowMs) {
+  updateLimit(lowerLimit, nowMs);
+  updateLimit(upperLimit, nowMs);
   if (liftMode == LiftMode::FAULT) {
     if (lowerLimit.active && upperLimit.active) {
       Serial.printf("EVENT,LIFT_REJECTED,FAULT_%s\n", liftFault);
@@ -184,16 +191,17 @@ void startLiftHome(uint32_t nowMs) {
     liftMode = LiftMode::UNHOMED;
   }
   liftLastCommandMs = nowMs;
-  // An already-active lower input must release and retrigger; never accept
-  // a stuck input as HOME. The bounded settle starts only on a new edge.
+  // Check stable inputs with zero pulses first. An already-pressed bottom
+  // switch means HOME immediately, as requested for this mechanism.
   liftHomed = false;
   liftHomeLeavingUpper = upperLimit.active;
   liftHomeStartedMs = nowMs;
   liftMode = LiftMode::HOMING;
-  liftHomeStage = lowerLimit.active ? LiftHomeStage::RELEASE_LOWER : LiftHomeStage::SEEK_LOWER;
+  liftHomeStage = LiftHomeStage::CHECK_LOWER;
   liftHomeStageStartSteps = liftStepper.currentPosition();
   liftHomeStageStartedMs = nowMs;
-  liftStepper.setSpeed((lowerLimit.active ? 1 : -1)*metresToSteps(LIFT_HOME_SPEED_M_S));
+  liftStepper.moveTo(liftStepper.currentPosition());
+  liftStepper.setSpeed(0.);
   Serial.println(liftHomeLeavingUpper
     ? "EVENT,LIFT_HOME_STARTED_FROM_UPPER"
     : "EVENT,LIFT_HOME_STARTED");
@@ -217,6 +225,10 @@ void setLiftTarget(float targetMetres, uint32_t nowMs) {
 
 void handleSerialCommand(char *line, uint32_t nowMs) {
   (void)nowMs;
+  if (strcmp(line, "LIFT,INFO") == 0) {
+    Serial.println("INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3");
+    return;
+  }
   if (strcmp(line, "LIFT,HOME") == 0) {
     enqueueLiftCommand(LiftCommandType::HOME);
     return;
@@ -292,7 +304,7 @@ void updateLift(uint32_t nowMs) {
     return;
   }
 
-  // Watchdog applies to release, seek AND settle, before any step is emitted.
+  // Watchdog applies to input checking, seek AND settle, before any pulse.
   if ((liftMode == LiftMode::MOVING || liftMode == LiftMode::HOMING) &&
       nowMs - liftLastCommandMs > LIFT_COMMAND_TIMEOUT_MS) {
     const bool wasHoming = liftMode == LiftMode::HOMING;
@@ -307,33 +319,38 @@ void updateLift(uint32_t nowMs) {
       setLiftFault("HOME_TIMEOUT");
       return;
     }
-    if (liftHomeStage == LiftHomeStage::RELEASE_LOWER) {
-      if (upperLimit.active ||
-          nowMs-liftHomeStageStartedMs > LIFT_HOME_LOWER_RELEASE_TIMEOUT_MS ||
-          labs(liftStepper.currentPosition()-liftHomeStageStartSteps) >= LIFT_HOME_LOWER_RELEASE_MAX_STEPS) {
-        setLiftFault("HOME_LOWER_STUCK");
+    if (liftHomeStage == LiftHomeStage::CHECK_LOWER) {
+      if (nowMs-liftHomeStageStartedMs > LIFT_HOME_INPUT_CHECK_TIMEOUT_MS) {
+        setLiftFault("HOME_INPUT_UNSTABLE");
         return;
       }
-      if (!lowerLimit.active) {
-        liftStepper.setSpeed(0.);
-        liftHomeStage = LiftHomeStage::SEEK_LOWER;
-        liftHomeStageStartedMs = nowMs;
-      } else {
-        liftStepper.setSpeed(metresToSteps(LIFT_HOME_SPEED_M_S));
-        liftStepper.runSpeed();
+      if (lowerLimit.active != lowerLimit.rawActive ||
+          nowMs-lowerLimit.changedAtMs < LIMIT_DEBOUNCE_MS) return;
+      if (lowerLimit.active) {
+        if (upperLimit.active || upperLimit.rawActive) {
+          setLiftFault("BOTH_LIMITS");
+          return;
+        }
+        acceptLowerHome(true);
         return;
       }
+      liftHomeStage = LiftHomeStage::SEEK_LOWER;
+      liftHomeStageStartedMs = nowMs;
     }
     if (liftHomeStage == LiftHomeStage::HOME_SETTLE) {
       const long travelled = liftHomeStageStartSteps-liftStepper.currentPosition();
-      if (!lowerLimit.active || upperLimit.active || travelled < 0 ||
+      // Count from the first electrical contact, including any switch bounce.
+      // Never restart or extend the 100-step allowance on another edge.
+      if (upperLimit.active || upperLimit.rawActive || travelled < 0 ||
           travelled > LIFT_HOME_SETTLE_STEPS ||
           nowMs-liftHomeStageStartedMs > LIFT_HOME_SETTLE_TIMEOUT_MS) {
         setLiftFault("HOME_SETTLE_FAILED");
         return;
       }
       if (travelled == LIFT_HOME_SETTLE_STEPS) {
-        acceptLowerHome();
+        liftStepper.setSpeed(0.);
+        // Bounce may settle while stopped at exactly 1 mm; no extra steps.
+        if (lowerLimit.active && lowerLimit.rawActive) acceptLowerHome();
         return;
       }
       liftStepper.setSpeed(-metresToSteps(LIFT_HOME_SPEED_M_S));
@@ -360,8 +377,9 @@ void updateLift(uint32_t nowMs) {
 
   // A fresh trigger starts the bounded HOME-only exception. Normal downward
   // motion is blocked at the switch and never redefines the settled zero.
-  if (lowerLimit.active) {
-    if (liftMode == LiftMode::HOMING && liftHomeStage == LiftHomeStage::SEEK_LOWER) {
+  if (lowerLimit.rawActive || lowerLimit.active) {
+    if (liftMode == LiftMode::HOMING && liftHomeStage == LiftHomeStage::SEEK_LOWER
+        && lowerLimit.rawActive) {
       liftStepper.setSpeed(0.);
       liftHomeStage = LiftHomeStage::HOME_SETTLE;
       liftHomeStageStartSteps = liftStepper.currentPosition();
@@ -402,6 +420,8 @@ void updateLiftSnapshot() {
   snapshot.speedStepsPerSecond = liftStepper.speed();
   snapshot.lowerActive = lowerLimit.active;
   snapshot.upperActive = upperLimit.active;
+  snapshot.homeCompletionCount = liftHomeCompletionCount;
+  snapshot.homeSkippedActive = liftHomeSkippedActive;
   snprintf(snapshot.fault, sizeof(snapshot.fault), "%s", liftFault);
   portENTER_CRITICAL(&liftSnapshotMux);
   sharedLift = snapshot;
@@ -421,13 +441,14 @@ void publishLiftTelemetry(uint32_t nowMs) {
   liftLastTelemetryMs = nowMs;
   const LiftSnapshot snapshot = getLiftSnapshot();
   Serial.printf(
-    "LIFT,1,%lu,%s,%u,%.5f,%.5f,%.5f,%u,%u,%s\n",
+    "LIFT,2,%lu,%s,%u,%.5f,%.5f,%.5f,%u,%u,%s,%lu,%u\n",
     static_cast<unsigned long>(nowMs), liftModeName(snapshot.mode),
     snapshot.homed ? 1U : 0U, stepsToMetres(snapshot.positionSteps),
     stepsToMetres(snapshot.targetSteps),
     snapshot.speedStepsPerSecond / static_cast<float>(LIFT_STEPS_PER_M),
     snapshot.lowerActive ? 1U : 0U, snapshot.upperActive ? 1U : 0U,
-    snapshot.fault);
+    snapshot.fault, static_cast<unsigned long>(snapshot.homeCompletionCount),
+    snapshot.homeSkippedActive ? 1U : 0U);
 }
 
 void TaskLift(void *pvParameters) {

@@ -29,7 +29,7 @@ Tốc độ tối đa 1000 bước/s và gia tốc 500 bước/s².
 ## Build và nạp
 
 ```bash
-cd ~/tai_robot_one/tai_robot_one_backup/esp32_firmware/Projects/bno055_imu_monitor
+cd /home/admin/tai_robot_one/robot_amr/esp32_firmware/Projects/bno055_imu_monitor
 pio run
 pio run --target upload --upload-port /dev/tai_imu
 ```
@@ -39,8 +39,9 @@ Không mở PlatformIO monitor khi ROS bridge đang dùng `/dev/tai_imu`.
 ## Protocol Serial
 
 - `IMU,1,...`: quaternion, gyro, acceleration và calibration.
-- `LIFT,HOME`: chạy xuống công tắc đáy và đặt vị trí 0.
+- `LIFT,HOME`: kiểm tra công tắc đáy trước; nếu đã chạm ổn định thì đặt HOME=0 không phát xung. Nếu chưa chạm thì tìm đáy, từ lần chạm đầu hạ thêm đúng 100 bước (1 mm), chờ ổn định rồi đặt vị trí 0.
+- `LIFT,INFO`: trả `INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3`; luồng lấy hàng dùng để kiểm tra cấu hình homing.
 - `LIFT,SET,0.02000`: đặt chiều cao tuyệt đối theo mét.
 - `LIFT,STOP`: dừng phát xung.
 - `LIFT,HB`: heartbeat khi HOME.
-- `LIFT,1,...`: phản hồi vị trí, tốc độ và công tắc để RViz bám càng thật.
+- `LIFT,2,...`: phản hồi vị trí, tốc độ, công tắc, số lần HOME đã hoàn thành và cờ bỏ qua chuyển động do công tắc đã chạm. Bridge vẫn đọc được protocol `LIFT,1` cũ.

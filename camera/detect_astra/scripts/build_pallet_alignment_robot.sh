@@ -5,7 +5,7 @@ project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source /opt/ros/jazzy/setup.bash
 set -u
 robot_source="$project_dir/../../ros2_ws"
-lidar_source=${PALLET_LIDAR_SOURCE:-/home/admin/tai_robot_one/ros2_ws/src/sllidar_ros2}
+lidar_source=${PALLET_LIDAR_SOURCE:-$robot_source/src/sllidar_ros2}
 if [[ ! -f "$lidar_source/package.xml" ]]; then
   echo "Không tìm thấy mã driver lidar: $lidar_source" >&2
   exit 1

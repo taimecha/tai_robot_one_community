@@ -40,6 +40,8 @@ class TargetNode(CameraReceiver):
         self.pending_images = {'rgb': deque(maxlen=12), 'depth': deque(maxlen=16)}
         self.pending_color_info = deque(maxlen=16)
         self.pending_seed = None
+        self.input_diagnostics = {}
+        self.processing_diagnostics = {}
         self.last_seed_stamp_ns = 0
         self.recognition_start_ns = 0
         self.recognition_reset_pending = False
@@ -47,6 +49,7 @@ class TargetNode(CameraReceiver):
         evidence_dir = getattr(args, 'measurement_evidence_dir', None)
         self.measurement_evidence = MeasurementEvidenceRecorder(evidence_dir) if evidence_dir else None
         self.publisher = self.create_publisher(PalletTarget, '/pallet/target', 1)
+        self.tracking_publisher = self.create_publisher(String, '/pallet/tracking/status', 1)
         self.preview_publisher = self.create_publisher(
             CompressedImage, '/pallet/preview/compressed',
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
@@ -54,7 +57,7 @@ class TargetNode(CameraReceiver):
         self.session_sub = self.create_subscription(String, '/pallet/recognition/status', self.on_session,
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.r3_tracking_paused = False
+        self.r3_tracking_paused = bool(getattr(args, 'start_paused', False))
         self.create_service(SetBool, '/pallet/r3/pause_target_tracking', self.pause_r3_tracking)
 
     def pause_r3_tracking(self, request, response):
@@ -103,6 +106,28 @@ class TargetNode(CameraReceiver):
             self.recognition_reset_pending = False
             return reset
 
+    def publish_tracking(self, estimator, issue=''):
+        """Acknowledge a current visual track, never a cached depth pose."""
+        now = self.get_clock().now().nanoseconds/1e9
+        with self.lock:
+            inputs = {name: dict(value) for name, value in self.input_diagnostics.items()}
+        state = dict(published_ros_s=now,
+            started_ros_s=self.recognition_start_ns/1e9,
+            seed_capture_ros_s=estimator.seed_stamp_ns/1e9,
+            rgb_capture_ros_s=estimator.tracker.stamp_ns/1e9,
+            active=bool(estimator.tracker.active and not self.r3_tracking_paused),
+            confirming_samples=len(estimator.history), issue=issue,
+            inputs=inputs, processing=dict(self.processing_diagnostics))
+        self.tracking_publisher.publish(String(data=json.dumps(state, allow_nan=False)))
+
+    def check_registration(self):
+        started = time.monotonic()
+        super().check_registration()
+        elapsed = (time.monotonic()-started)*1000
+        self.processing_diagnostics['registration_ms'] = elapsed
+        if elapsed > 200:
+            self.get_logger().warn(f'Camera source check occupied receiver for {elapsed:.0f} ms')
+
     def on_seed(self, msg):
         if msg.valid and stamp_ns(msg) > max(self.last_seed_stamp_ns, self.recognition_start_ns):
             with self.lock:
@@ -135,8 +160,13 @@ class TargetNode(CameraReceiver):
                     stamp_ns=stamp_ns(msg), class_name=msg.class_name, confidence=msg.confidence)
 
     def receive(self, stream, msg):
+        wall = time.monotonic()
         with self.lock:
-            self.pending_images[stream].append((msg, time.monotonic()))
+            previous = self.input_diagnostics.get(stream, {})
+            self.input_diagnostics[stream] = dict(received_wall_s=wall,
+                callback_gap_ms=(wall-previous.get('received_wall_s', wall))*1000,
+                capture_age_ms=(self.get_clock().now().nanoseconds-stamp_ns(msg))/1e6)
+            self.pending_images[stream].append((msg, wall))
 
     def receive_info(self, stream, msg):
         with self.lock:
@@ -330,6 +360,7 @@ def main():
                 continue
             if node.take_session_reset():
                 estimator.reset('new recognition session; waiting for a fresh YOLO seed')
+                node.publish_tracking(estimator, estimator.loss_reason)
             now = time.monotonic()
             if now < next_measurement:
                 time.sleep(min(.005, next_measurement-now))
@@ -342,18 +373,27 @@ def main():
                     if now-last_pair > .5:
                         estimator.reset('camera RGB-D input gap exceeded 500 ms')
                     node.publisher.publish(empty_message(node.get_clock().now().to_msg(), node.status))
+                    node.publish_tracking(estimator, node.status)
                     last_invalid = now
                 time.sleep(.002)
                 continue
             last_pair = now
             next_measurement = now+1/args.track_max_fps if args.track_max_fps else 0
+            processing_started = time.monotonic()
             try:
                 msg = process_pair(pair, args, node, estimator)
             except (ValueError, RuntimeError, cv2.error) as exc:
                 msg = empty_message(pair[0].header.stamp, str(exc), pair[2])
             if stamp_ns(msg) < node.recognition_start_ns:
                 msg = empty_message(msg.header.stamp, 'Waiting for new recognition session')
+            node.processing_diagnostics['rgbd_ms'] = (time.monotonic()-processing_started)*1000
+            publishing_started = time.monotonic()
+            node.publish_tracking(estimator, '' if msg.valid else msg.status)
             node.publisher.publish(msg)
+            node.processing_diagnostics['publish_ms'] = (time.monotonic()-publishing_started)*1000
+            if node.processing_diagnostics['publish_ms'] > 200:
+                node.get_logger().warn('RGB-D publish elapsed '
+                    f'{node.processing_diagnostics["publish_ms"]:.0f} ms')
             if now >= next_preview:
                 node.preview(pair[0].header, decode_image(pair[0]), estimator, msg)
                 next_preview = now+1/args.preview_fps if args.preview_fps else 0
