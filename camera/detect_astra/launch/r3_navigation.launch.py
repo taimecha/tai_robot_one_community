@@ -10,11 +10,12 @@ import tempfile
 
 import yaml
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-def navigation_parameters():
+def navigation_parameters(loaded_delivery=False):
     root = Path(__file__).resolve().parents[3]
     params = yaml.safe_load((root/'ros2_ws/config/nav2_params.yaml').read_text())
 
@@ -67,6 +68,10 @@ def navigation_parameters():
             if optional in costmap:
                 costmap[optional]['enabled']=False
         costmap.update(update_frequency=5.,publish_frequency=2.)
+        if loaded_delivery:
+            # Same chassis and front projection as at A. Widen the front
+            # for the 355 mm pallet, its alignment tolerance and map padding.
+            costmap['footprint']='[[0.78,0.22],[0.78,-0.22],[0.38,-0.25],[-0.33,-0.25],[-0.33,0.25],[0.38,0.25]]'
     smoother=params['velocity_smoother']['ros__parameters']
     # Match the real drive's braking limits instead of adding a long final
     # ramp after Nav2 declares arrival. Keep a modest cap below the older
@@ -85,11 +90,29 @@ def navigation_parameters():
     monitor['VelocityStop']['translation_reverse']['linear_min']=-.12
     # Retain the complete body/fork stopping envelope and footprint prediction.
     monitor['VelocityStop']['enabled']=True
+    if loaded_delivery:
+        stop=monitor['VelocityStop']
+        stop['translation_forward']['points']='[[0.88,0.28],[0.88,-0.28],[0.48,-0.35],[-0.37,-0.29],[-0.37,0.29],[0.48,0.35]]'
+        stop['translation_reverse']['points']='[[0.82,0.26],[0.82,-0.26],[0.42,-0.29],[-0.50,-0.35],[-0.50,0.35],[0.42,0.29]]'
+        stop['rotation_and_rest']['points']=params['local_costmap']['local_costmap']['ros__parameters']['footprint']
     return params
 
 
 def navigation_actions(context):
-    params=navigation_parameters()
+    shared_navigation=LaunchConfiguration('shared_navigation').perform(context)=='true'
+    loaded_delivery=shared_navigation or LaunchConfiguration('loaded_delivery').perform(context)=='true'
+    private_navigation=loaded_delivery or LaunchConfiguration('delivery_teaching').perform(context)=='true'
+    params=navigation_parameters(loaded_delivery=loaded_delivery)
+    root = Path(__file__).resolve().parents[3]
+    gate_args = []
+    if loaded_delivery:
+        sys.path.insert(0, str(root/'simulation'))
+        from r3_delivery_topics import delivery_velocity
+
+        gate_args = ['--ros-args', '-p', f'wait_for_delivery_handoff:={str(not shared_navigation).lower()}',
+                     '-p', f'shared_navigation:={str(shared_navigation).lower()}',
+                     '-r', f'/cmd_vel_nav:={delivery_velocity("cmd_vel_nav")}',
+                     '-r', f'/cmd_vel_nav_checked:={delivery_velocity("cmd_vel_nav_checked")}']
     # Nav2's nested costmap nodes need a YAML file, not a flat parameter dict.
     with tempfile.NamedTemporaryFile(mode='w',prefix='r3_nav2_',suffix='.yaml',delete=False) as file:
         yaml.safe_dump(params,file,sort_keys=False)
@@ -100,21 +123,32 @@ def navigation_actions(context):
     nodes=[]
     for package,name in specs:
         remaps=[('/scan','/scan_filtered')]
+        if name=='bt_navigator' and private_navigation:
+            # Teaching forwards RViz requests. A loaded mission owns D and
+            # uses this endpoint directly, preventing public RViz preemption.
+            remaps.extend([('navigate_to_pose','/pallet/r3/delivery/navigate_to_pose'),
+                ('navigate_through_poses','/pallet/r3/delivery/navigate_through_poses'),
+                ('goal_pose','/pallet/r3/delivery/internal_goal_pose')])
         if name in ('controller_server','behavior_server'):
-            remaps.append(('cmd_vel','cmd_vel_nav'))
+            remaps.append(('cmd_vel', delivery_velocity('cmd_vel_nav') if loaded_delivery else 'cmd_vel_nav'))
         if name=='velocity_smoother':
-            remaps.append(('cmd_vel','cmd_vel_nav_checked'))
-            remaps.append(('cmd_vel_smoothed','/cmd_vel_smoothed'))
+            remaps.append(('cmd_vel', delivery_velocity('cmd_vel_nav_checked') if loaded_delivery else 'cmd_vel_nav_checked'))
+            remaps.append(('cmd_vel_smoothed', delivery_velocity('cmd_vel_smoothed') if loaded_delivery else '/cmd_vel_smoothed'))
+        if loaded_delivery and name=='collision_monitor':
+            remaps.extend((topic, delivery_velocity(topic)) for topic in ('/cmd_vel_smoothed', '/cmd_vel_safe'))
         nodes.append(Node(package=package,executable=name,name=name,output='screen',
                           parameters=[filename],remappings=remaps))
     nodes.append(Node(package='nav2_lifecycle_manager',executable='lifecycle_manager',
         name='lifecycle_manager_navigation',output='screen',parameters=[dict(use_sim_time=False,
             autostart=True,node_names=[name for _,name in specs],bond_timeout=4.)]))
-    root = Path(__file__).resolve().parents[3]
     nodes.append(ExecuteProcess(cmd=[sys.executable,
-        str(root/'simulation/r3_navigation_recovery_gate.py')],output='screen'))
+        str(root/'simulation/r3_navigation_recovery_gate.py'), *gate_args],output='screen'))
     return nodes
 
 
 def generate_launch_description():
-    return LaunchDescription([OpaqueFunction(function=navigation_actions)])
+    return LaunchDescription([
+        DeclareLaunchArgument('delivery_teaching',default_value='false'),
+        DeclareLaunchArgument('loaded_delivery',default_value='false'),
+        DeclareLaunchArgument('shared_navigation',default_value='false'),
+        OpaqueFunction(function=navigation_actions)])

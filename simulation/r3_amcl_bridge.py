@@ -33,7 +33,8 @@ from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from r3_core import compose, inverse, wrap
-from r3_scan_map_check import ScanMapCheck, LIVE_SCAN_MAX_SAMPLES,validate_recognition_scan_match
+from r3_scan_map_check import (ScanMapCheck, LIVE_SCAN_MAX_SAMPLES, validate_navigation_scan_match,
+                               validate_recognition_scan_match)
 from r3_stationary_localization import StationaryEvidence
 from r3_amcl_observation_pair import validate_observation_pair
 from r3_amcl_quality import concentrated_particle_support,validate_runtime_particles
@@ -404,6 +405,8 @@ class AmclTrialBridge(Node):
         self.global_fault = None
         self.ready_file_written = False
         self.trial_handoff = None
+        self.delivery_handoff = None
+        self.delivery_refresh_after = None
         self.pending = deque(maxlen=20)
         self.pending_issue = ''
         self.pair_validation_cache={}
@@ -436,20 +439,32 @@ class AmclTrialBridge(Node):
         self.create_subscription(LaserScan, '/scan_filtered', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(OccupancyGrid, '/map', self.on_map, reliable)
         self.create_service(Trigger, '/pallet/r3/localization/enable_trial', self.enable_trial)
+        self.create_service(Trigger, '/pallet/r3/localization/enable_delivery_navigation',
+                            self.enable_delivery_navigation)
         self.create_timer(.05, self.tick)
 
-    def _check_trial_handoff(self, now):
-        """Validate the existing parked posterior without updating AMCL."""
-        if not self.continuous_localization or not self.navigation_monitor or self.stationary_inspection:
-            raise ValueError('trial handoff requires a continuous navigation monitor')
+    def _check_handoff_context(self, now, *, from_navigation):
+        if (not self.continuous_localization or self.navigation_monitor != from_navigation
+                or self.stationary_inspection):
+            raise ValueError('localization handoff requires the previous continuous role')
         if not self.active or not self.map_received or self.scan_checker is None:
             raise ValueError('active AMCL and the selected map are required for trial handoff')
-        if self.correction.fault or not self.correction.measurement_ok:
-            raise ValueError(self.correction.fault or 'AMCL observation is not valid for trial handoff')
+        if self.correction.fault:
+            raise ValueError(self.correction.fault)
         if not self.global_initialized or self.global_fault:
             raise ValueError(self.global_fault or 'global localization has not been validated')
         if not self.robot_is_stationary(now):
             raise ValueError('robot must be stationary with fresh odometry before trial handoff')
+        for topic in ('/cmd_vel_nav','/cmd_vel_nav_checked','/cmd_vel_localized','/cmd_vel_smoothed','/cmd_vel_safe'):
+            publishers = self.get_publishers_info_by_topic(topic)
+            if publishers:
+                owners = ', '.join(getattr(endpoint,'node_name','unknown') for endpoint in publishers)
+                raise ValueError(f'command publishers must stop before trial handoff: {topic}: {owners}')
+
+    def _parked_handoff_observation(self, now, *, newer_than=None,
+                                   validate_scan=validate_recognition_scan_match):
+        if not self.correction.measurement_ok:
+            raise ValueError('AMCL observation is not valid for handoff')
         cached, reason = self.stationary_evidence.ready(now)
         if not cached:
             raise ValueError('stationary localization is not validated: '+reason)
@@ -457,6 +472,8 @@ class AmclTrialBridge(Node):
         if not isinstance(snapshot, dict) or self.latest_observation is None:
             raise ValueError('paired AMCL snapshot is unavailable for trial handoff')
         stamp = snapshot['amcl_stamp_s']
+        if newer_than is not None and stamp <= newer_than:
+            raise ValueError('waiting for the parked AMCL observation requested after pickup')
         if (self.continuous_invalid_after_stamp is not None
                 and stamp <= self.continuous_invalid_after_stamp):
             raise ValueError('new AMCL observation required after localization interruption')
@@ -479,7 +496,7 @@ class AmclTrialBridge(Node):
                 or scored_stamp is None or not -.05 <= now-scored_stamp <= SCAN_MAX_AGE_S
                 or fit.get('ready') is not True):
             raise ValueError('trial handoff requires fresh scan/map agreement')
-        validate_recognition_scan_match(fit)
+        validate_scan(fit)
         covariance = snapshot['covariance_6x6']
         if (len(covariance) != 36 or not all(math.isfinite(v) for v in covariance)
                 or any(covariance[i] < 0 for i in (0,7,35))
@@ -488,12 +505,12 @@ class AmclTrialBridge(Node):
             raise ValueError('trial handoff AMCL uncertainty requires <5 cm / 2 deg')
         metrics = snapshot['particle_metrics']
         validate_runtime_particles(metrics)
-        for topic in ('/cmd_vel_nav','/cmd_vel_nav_checked','/cmd_vel_localized','/cmd_vel_smoothed','/cmd_vel_safe'):
-            publishers = self.get_publishers_info_by_topic(topic)
-            if publishers:
-                owners = ', '.join(getattr(endpoint,'node_name','unknown') for endpoint in publishers)
-                raise ValueError(f'command publishers must stop before trial handoff: {topic}: {owners}')
         return tuple(transform), covariance, stamp
+
+    def _check_trial_handoff(self, now):
+        """Validate the existing parked posterior without updating AMCL."""
+        self._check_handoff_context(now, from_navigation=True)
+        return self._parked_handoff_observation(now)
 
     def enable_trial(self, request, response):
         """Reanchor the trial frame using the already validated posterior.
@@ -502,6 +519,10 @@ class AmclTrialBridge(Node):
         must have released all command topics before the first role change.
         Repeated requests cannot reanchor a target after capture has started.
         """
+        if self.delivery_handoff is not None:
+            response.success = False
+            response.message = 'delivery navigation already owns this localization session'
+            return response
         if self.trial_handoff is not None and not self.navigation_monitor:
             response.success = True
             response.message = json.dumps(dict(status='TRIAL_LOCALIZATION_ENABLED',
@@ -520,6 +541,7 @@ class AmclTrialBridge(Node):
             handoff = dict(enabled=True, at_ros_s=now, enabled_ros_s=now,
                 source_amcl_stamp_s=stamp, source_cloud_stamp_s=self.stationary_snapshot['cloud_stamp_s'],
                 baseline_map_odom=list(transform), nomotion_request_count=self.nomotion_request_count,
+                occupancy_map_signature=self.map_signature,
                 previous_role='navigation_monitor',
                 source='validated_navigation_snapshot_without_amcl_refresh')
             self.correction = correction
@@ -540,6 +562,54 @@ class AmclTrialBridge(Node):
         except (ValueError,TypeError,KeyError,RuntimeError) as exc:
             response.success = False
             response.message = str(exc)
+        return response
+
+    def enable_delivery_navigation(self, request, response):
+        """Release the bounded docking frame only from a validated parked pose."""
+        if self.delivery_handoff is not None:
+            response.success = True
+            response.message = json.dumps(self.delivery_handoff)
+            return response
+        now = self.get_clock().now().nanoseconds*1e-9
+        try:
+            resumed = getattr(self.args, 'resume_delivery', False)
+            if not resumed and self.trial_handoff is None:
+                raise ValueError('delivery handoff requires an existing docking session')
+            if not resumed and self.trial_handoff.get('occupancy_map_signature') != self.map_signature:
+                raise ValueError('map changed since the docking handoff')
+            self._check_handoff_context(now, from_navigation=resumed)
+            cached, _ = self.stationary_evidence.ready(now)
+            previous_stamp = (self.stationary_snapshot or {}).get('amcl_stamp_s')
+            old_snapshot = previous_stamp is not None and now-previous_stamp > AMCL_MAX_AGE_S
+            if (not resumed and self.delivery_refresh_after is None and not cached
+                    and (self.stationary_evidence.fault or old_snapshot)):
+                # After pickup, allow one new observation if the previous
+                # parked evidence was invalidated or hasn't validated again.
+                self.delivery_refresh_after = now
+                self.parking_refresh_armed = True
+                self.get_logger().info('Validating AMCL once after the completed pickup; retaining the same session')
+            transform, covariance, stamp = self._parked_handoff_observation(
+                now, newer_than=self.delivery_refresh_after, validate_scan=validate_navigation_scan_match)
+            correction = TrialCorrection(bound_total=False, recover_jumps=True)
+            correction.baseline = correction.last_transform = transform
+            correction.amcl_stamp = stamp
+            correction.xy_std = math.sqrt(max(covariance[0], covariance[7]))
+            correction.yaw_std_deg = math.degrees(math.sqrt(covariance[35]))
+            correction.measurement_ok = True
+            correction.reason = 'delivery navigation retains the validated parked AMCL observation'
+        except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+            response.success = False
+            response.message = str(exc)
+            return response
+        self.correction = correction
+        self.navigation_monitor = True
+        self.motion_prediction = None
+        self.last_parked_validation = None
+        self.delivery_handoff = dict(run_id=self.run_id, map_file=self.map_file,
+                                     at_ros_s=now, source_amcl_stamp_s=stamp,
+                                     post_pickup_refresh_requested_ros_s=self.delivery_refresh_after)
+        response.success = True
+        response.message = json.dumps(self.delivery_handoff)
         return response
 
     @staticmethod
@@ -897,6 +967,8 @@ class AmclTrialBridge(Node):
             recovering_stream=self.stream_recovery_ready(now,wall,
                 bool(capture_tf_ready and interfaces and self.nomotion_client.service_is_ready()))
             request_allowed=(request_allowed or recovering_stream) and capture_tf_ready
+            if request_allowed and not self.navigation_monitor and self.delivery_refresh_after is not None:
+                request_allowed = self.scan_stamp > self.delivery_refresh_after
         if (request_allowed and self.active and stationary and wall >= self.next_nomotion
                 and self.nomotion_future is None and self.nomotion_client.service_is_ready()):
             self.nomotion_future = self.nomotion_client.call_async(Empty.Request())
@@ -1354,6 +1426,7 @@ class AmclTrialBridge(Node):
         status['role']=('navigation_monitor' if self.navigation_monitor else
                         'stationary_inspection' if self.stationary_inspection else 'trial')
         status['trial_handoff']=self.trial_handoff
+        status['delivery_handoff']=self.delivery_handoff
         status['trial_handoff_at_ros_s']=(self.trial_handoff['at_ros_s'] if self.trial_handoff is not None else None)
         status['robot_stationary']=stationary
         status['live_observation_validated']=bool(live and ready)
@@ -1432,6 +1505,8 @@ def main():
                         help='Validate parked snapshots and live moving AMCL; refresh once per genuine parked episode')
     parser.add_argument('--navigation-monitor',action='store_true',
                         help='Monitor continuous localization for Nav2 without publishing short-trial control odometry')
+    parser.add_argument('--resume-delivery',action='store_true',
+                        help='Allow loaded navigation handoff after validating a new parked session')
     parser.add_argument('--external-control-odom',action='store_true',
                         help='A separate r3_control_odom process owns fresh EKF-to-trial odometry after handoff')
     parser.add_argument('--wait-ready',type=Path,
@@ -1439,6 +1514,8 @@ def main():
     args = parser.parse_args()
     if args.external_control_odom and not (args.continuous_localization or args.navigation_monitor):
         parser.error('--external-control-odom requires continuous localization')
+    if args.resume_delivery and not args.navigation_monitor:
+        parser.error('--resume-delivery requires --navigation-monitor')
     if not args.map.is_absolute() or not args.map.is_file():
         parser.error('--map must be the absolute path of the selected map YAML')
     if args.initial_pose is not None and not all(math.isfinite(v) for v in args.initial_pose):

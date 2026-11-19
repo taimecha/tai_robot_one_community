@@ -24,7 +24,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data,QoSProfile,DurabilityPolicy,ReliabilityPolicy
 from rclpy.time import Time
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import Odometry,OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import ParticleCloud
@@ -39,6 +39,7 @@ from r3_scan_map_check import ScanMapCheck,LIVE_SCAN_MAX_SAMPLES,validate_recogn
 from r3_stationary_localization import StationaryEvidence
 from r3_amcl_observation_pair import validate_pair_evidence
 from r3_amcl_quality import validate_runtime_particles
+from r3_delivery_topics import PRIVATE_ACTION, check_navigation_command_owners, delivery_velocity
 
 
 SCHEMA='r3_recognition_A_v1'
@@ -103,11 +104,11 @@ def pose_error(pose, goal):
     return math.dist(pose[:2],goal[:2]),abs(wrap(pose[2]-goal[2]))
 
 
-def validate_arrival(pose, goal):
+def validate_arrival(pose, goal, *, label='A'):
     xy,yaw=pose_error(pose,goal)
     if (not math.isfinite(xy) or not math.isfinite(yaw)
             or xy>=ARRIVAL_XY_TOLERANCE_M-1e-12 or yaw>ARRIVAL_YAW_TOLERANCE_RAD+1e-9):
-        raise RuntimeError(f'Nav2 reported success outside A arrival limits '
+        raise RuntimeError(f'Nav2 reported success outside {label} arrival limits '
                            f'(<{ARRIVAL_XY_TOLERANCE_M:.2f} m / {math.degrees(ARRIVAL_YAW_TOLERANCE_RAD):g} deg): '
                            f'{xy:.3f} m / {math.degrees(yaw):.2f} deg')
     return xy,yaw
@@ -204,7 +205,8 @@ def create_goal_json(path,value):
 
 class RecognitionGoal(Node):
     def __init__(self,request_nomotion=False,node_name='r3_recognition_goal',
-                 selected_map_file=None,*,context=None,continuous_localization=False):
+                 selected_map_file=None,*,context=None,continuous_localization=False,
+                 navigation_action='/navigate_to_pose',shared_navigation=False):
         super().__init__(node_name,context=context)
         self.amcl=None
         self.odom=None
@@ -212,7 +214,7 @@ class RecognitionGoal(Node):
         self.observations=deque(maxlen=30)
         self.tf=Buffer(cache_time=Duration(seconds=10.))
         self.listener=TransformListener(self.tf,self)
-        self.client=ActionClient(self,NavigateToPose,'/navigate_to_pose')
+        self.client=ActionClient(self,NavigateToPose,navigation_action)
         self.goal_handle=None
         self.result_future=None
         self.last_map_odom=None
@@ -264,6 +266,11 @@ class RecognitionGoal(Node):
         self.navigation_observation_stamp=None
         self.navigation_result=None
         self.navigation_finalization=[]
+        self.shared_navigation=shared_navigation
+        self.base_output=None
+        self.motion_enabled=False
+        self.forwarded_velocity_commands=0
+        self.next_a_graph_check=0.
         self.create_subscription(PoseWithCovarianceStamped,'/amcl_pose',self.on_amcl,
             QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -323,8 +330,13 @@ class RecognitionGoal(Node):
             self.stationary_evidence.invalidate('invalid stationary odom pose/twist')
             self._reset_a_scan_quality('invalid stationary odom pose/twist')
             self.odom=None;self.stationary_since=None;return
+        stamp=self.stamp(msg)
+        previous=self.stationary_evidence.odom_stamp
+        if self.continuous_localization and previous is not None and stamp-previous>.5:
+            self._restart_local_scan_window('local odom delivery interrupted; collect fresh scan evidence')
         self.odom=msg
-        self.stationary_evidence.update_odom(pose,velocity,self.stamp(msg),self.now())
+        self.stationary_evidence.update_odom(pose,velocity,stamp,self.now(),
+                                            check_capture_continuity=not self.continuous_localization)
         if self.stationary_evidence.fault:
             self._reset_a_scan_quality(self.stationary_evidence.fault)
         still=math.hypot(*velocity[:2])<.005 and abs(velocity[2])<.01
@@ -343,17 +355,30 @@ class RecognitionGoal(Node):
             previous=self.scan_stamp
             if (self.continuous_localization and self.stationary_snapshot is not None
                     and not getattr(self,'stationary_startup_pending',False)
-                    and previous is not None and (stamp<previous or stamp-previous>.5)):
-                reason='raw LiDAR capture gap/clock change invalidated stationary AMCL snapshot'
-                self.stationary_evidence.invalidate(reason)
-                self._reset_a_scan_quality(reason)
+                    and previous is not None):
+                if stamp<previous:
+                    reason='LiDAR timestamp moved backwards; a new AMCL observation is required'
+                    self.stationary_evidence.invalidate(reason)
+                    self._restart_local_scan_window(reason)
+                elif stamp-previous>.5:
+                    # Missing callbacks on this best-effort subscription do
+                    # not establish that the supervisor's source was lost.
+                    self._restart_local_scan_window('local LiDAR delivery interrupted; collect fresh scan evidence')
             self.scan_stamp=stamp
             self.scan=msg
-            self.poll_stationary_scan()
+            if not self.continuous_localization:
+                self.poll_stationary_scan()
         elif self.stationary_mode:
             self.scan=None;self.scan_stamp=None
             self.stationary_evidence.invalidate('unexpected stationary LiDAR frame')
             self._reset_a_scan_quality('unexpected stationary LiDAR frame')
+
+    def _restart_local_scan_window(self,reason):
+        self.stationary_evidence.restart_scan_window(reason)
+        self.stationary_validated_poses.clear()
+        self.last_validated_scan=None
+        self.stationary_fit_key=None
+        self._reset_a_scan_quality(reason)
 
     def poll_stationary_scan(self):
         # TF can arrive a few milliseconds after a scan callback. Retry on a
@@ -1050,6 +1075,44 @@ class RecognitionGoal(Node):
             raise RuntimeError('ROS stopped during Nav2 action')
         return future.result()
 
+    def open_navigation_relay(self, callback):
+        self.base_output=self.create_publisher(Twist,'/cmd_vel_safe',
+            QoSProfile(depth=1,lifespan=Duration(seconds=.2)))
+        self.create_subscription(Twist,delivery_velocity('/cmd_vel_safe'),callback,
+                                 qos_profile_sensor_data)
+
+    def wait_check(self,check,timeout):
+        deadline=time.monotonic()+timeout
+        reason='đang chờ dữ liệu'
+        while rclpy.ok() and time.monotonic()<deadline:
+            self.spin_once()
+            try:
+                return check()
+            except (ValueError,TransformException) as exc:
+                reason=str(exc)
+        raise RuntimeError(reason)
+
+    def check_navigation_relay(self):
+        check_navigation_command_owners(self,relay=self.get_fully_qualified_name(),navigation=True)
+        receivers=self.get_subscriptions_info_by_topic('/cmd_vel_safe')
+        if sum((p.node_namespace,p.node_name)==('/','cmd_vel_stamper') for p in receivers)!=1:
+            raise ValueError('Đầu nhận lệnh bánh chưa sẵn sàng.')
+
+    def on_a_safe_velocity(self,message):
+        if not self.motion_enabled:
+            return
+        status=self.stationary_status or {}
+        stamp=status.get('published_ros_s')
+        command=Twist()
+        if (status.get('run_id')==self.navigation_run_id and status.get('map_file')==self.selected_map_file
+                and status.get('navigation_monitor') is True and status.get('trial_handoff') is None
+                and not status.get('localization_fault') and isinstance(stamp,(int,float))
+                and -.05<=self.now()-stamp<=.75 and self.map_signature==self.navigation_map_signature
+                and all(math.isfinite(v) for v in (message.linear.x,message.angular.z))):
+            command.linear.x,command.angular.z=message.linear.x,message.angular.z
+        self.base_output.publish(command)
+        self.forwarded_velocity_commands+=1
+
     def monitor_navigation_session(self):
         """Keep identity faults fatal; the bridge owns jump recovery.
 
@@ -1070,6 +1133,13 @@ class RecognitionGoal(Node):
             raise ValueError('localization role changed during navigation')
         if status.get('localization_fault'):
             raise ValueError('localization fault during navigation: '+str(status['localization_fault']))
+        if getattr(self,'shared_navigation',False) and self.motion_enabled:
+            if status.get('trial_handoff') is not None:
+                raise ValueError('quyền điều khiển chặng A đã được bàn giao')
+            wall=time.monotonic()
+            if wall>=self.next_a_graph_check:
+                self.check_navigation_relay()
+                self.next_a_graph_check=wall+.5
         recovery=status.get('navigation_recovery') or {}
         holding=recovery.get('hold_commands') is True
         if holding != getattr(self,'navigation_recovery_hold',False):
@@ -1165,6 +1235,11 @@ class RecognitionGoal(Node):
                 particle_metrics=self.particle_gate.metrics,
                 localization_evidence=self.localization_evidence(),
                 physical_alignment_verified=False)
+        if self.shared_navigation:
+            check_navigation_command_owners(self,navigation=True)
+            self.open_navigation_relay(self.on_a_safe_velocity)
+            self.wait_check(self.check_navigation_relay,5.)
+            start_pose=self.wait_pose(10.)
         if getattr(self,'continuous_localization',False):
             self.navigation_run_id=self.stationary_status['run_id']
             self.navigation_map_signature=self.map_signature
@@ -1209,7 +1284,14 @@ class RecognitionGoal(Node):
                 if not self.goal_handle.accepted:
                     raise RuntimeError('Nav2 rejected the saved Point A')
                 self.result_future=self.goal_handle.get_result_async()
-                result=self.await_future(self.result_future,deadline,True)
+                self.motion_enabled=self.shared_navigation
+                try:
+                    result=self.await_future(self.result_future,deadline,True)
+                finally:
+                    self.motion_enabled=False
+                    if self.base_output is not None and rclpy.ok():
+                        self.base_output.publish(Twist())
+                        self.forwarded_velocity_commands+=1
                 self.navigation_action_active=False
                 self.navigation_result=dict(action_status=result.status,attempt=attempt,
                     reported_ros_s=self.get_clock().now().nanoseconds*1e-9
@@ -1241,7 +1323,8 @@ class RecognitionGoal(Node):
             if getattr(self,'continuous_localization',False):
                 self.monitor_navigation_session()
             return dict(status='AT_NEW_A',already_at_A=False,
-                        navigation_goal_attempted=True,direct_velocity_commands_from_this_process=0,
+                        navigation_goal_attempted=True,
+                        direct_velocity_commands_from_this_process=self.forwarded_velocity_commands,
                         goal_id=value['goal_id'],goal=str(goal_path),
                         goal_pose_xyyaw=list(goal),arrival_pose_xyyaw=list(pose),
                         position_error_m=xy,heading_error_deg=math.degrees(yaw),
@@ -1275,6 +1358,8 @@ def main():
     navigate.add_argument('--timeout',type=float,default=900.)
     navigate.add_argument('--continuous-localization',action='store_true',
                          help='Use continuously validated live/parked AMCL snapshots without repeated no-motion updates')
+    navigate.add_argument('--shared-navigation',action='store_true',
+                          help='Use the parked-between-actions Nav2 instance for the pallet trip')
     purpose=navigate.add_mutually_exclusive_group()
     purpose.add_argument('--check-only',action='store_true',
                          help='Check localization and Nav2 readiness; never send a navigation goal')
@@ -1294,8 +1379,13 @@ def main():
             pose_xyyaw=value['pose_xyyaw'],goal_id=value['goal_id']),indent=2))
         return 0
     continuous=args.command=='navigate' and args.continuous_localization
+    shared=args.command=='navigate' and args.shared_navigation
+    if shared and (not continuous or args.recognize_here):
+        parser.error('--shared-navigation requires continuous navigation to A')
     rclpy.init();node=RecognitionGoal(request_nomotion=args.command=='navigate' and not continuous,
-                                   selected_map_file=args.map,continuous_localization=continuous);result=None
+                                   selected_map_file=args.map,continuous_localization=continuous,
+                                   navigation_action=PRIVATE_ACTION if shared else '/navigate_to_pose',
+                                   shared_navigation=shared);result=None
     try:
         if args.command=='save':
             result=node.save(args.map,args.output,args.timeout)
@@ -1310,7 +1400,7 @@ def main():
     except (KeyboardInterrupt,RuntimeError,ValueError,TransformException) as exc:
         result=dict(status='BLOCKED',reason=str(exc),
             navigation_goal_attempted=node.navigation_goal_attempted,
-            direct_velocity_commands_from_this_process=0)
+            direct_velocity_commands_from_this_process=node.forwarded_velocity_commands)
         if isinstance(exc,MotionPredictionLimitError):
             result['motion_prediction_failure']=exc.evidence
         if getattr(node,'navigation_start_evidence',None) is not None:

@@ -167,6 +167,66 @@ class PickupClearanceTests(unittest.TestCase):
         self.assertEqual(report['command_speed_mps'], .14)
         self.assertAlmostEqual(report['stopping_distance_m'], .14*.2+.14**2/(2*.08))
 
+    def recorded_clearance_hold(self):
+        # 20261118_145749_nwA1jk, expressed relative to the measured pallet.
+        target = (0., 0., 0.)
+        join = base_for_fork((-.535, 0., 0.), self.g)
+        phases = [dict(type='APPROACH', poses=[compose(join, (-.4, 0., 0.)), join]),
+                  dict(type='STRAIGHT', poses=[join, base_for_fork((-.02, 0., 0.), self.g)])]
+        follower = FixedPlanFollower(phases, target, self.g, continuous_insertion=True)
+        follower.start(True)
+        follower.v, follower.w = .06520879195790168, .00541784562463881
+        follower.reference_v = .046
+        pose = base_for_fork((-.05312645541059712, .008694029989900931, .0010487867489469595), self.g)
+        command = follower.step(pose, .03148, insertion_pose=pose, measured_speed=.02755787128434387,
+                                insertion_yaw_rate=.0837634111913917)
+        self.assertEqual(command, (0., 0.))
+        self.assertEqual(follower.state, 'CLEARANCE_HOLD', follower.reason)
+        self.assertEqual(follower.insertion_report['velocity_source'], 'measured_motion')
+        self.assertEqual(follower.insertion_report['required_clearance_m'], .010)
+        return follower, pose
+
+    def test_recorded_yaw_rate_can_recover_after_a_verified_stop(self):
+        follower, pose = self.recorded_clearance_hold()
+        for _ in range(7):
+            self.assertEqual(follower.step(pose, insertion_pose=pose, measured_speed=0.), (0., 0.))
+            self.assertEqual(follower.state, 'CLEARANCE_HOLD')
+        for _ in range(5):
+            self.assertEqual(follower.step(pose, insertion_pose=pose, measured_speed=0.,
+                                           wheels_stopped=True), (0., 0.))
+        self.assertEqual(follower.state, 'STRAIGHT')
+        self.assertEqual(follower.clearance_holds[-1]['outcome'], 'resumed')
+        speed, omega = follower.step(pose, insertion_pose=pose, measured_speed=0.)
+        self.assertGreater(speed, 0.)
+        self.assertLessEqual(speed, self.g['acceleration']*.05)
+        self.assertTrue(follower.insertion_report['ready'])
+
+    def test_clearance_hold_latches_without_encoder_confirmation(self):
+        follower, pose = self.recorded_clearance_hold()
+        for _ in range(40):
+            self.assertEqual(follower.step(pose, .1, insertion_pose=pose, measured_speed=0.), (0., 0.))
+        self.assertEqual(follower.state, 'STOP_LATCHED')
+        self.assertEqual(follower.clearance_holds[-1]['outcome'], 'braking_timeout')
+
+    def test_padding_intersection_in_either_frame_still_latches(self):
+        follower, pose = self.recorded_clearance_hold()
+        close = base_for_fork((-.053, .045, 0.), self.g)
+        self.assertIsNone(collision(close, follower.target, self.g))
+        command = follower.step(pose, insertion_pose=close, measured_speed=.03,
+                                insertion_yaw_rate=.084)
+        self.assertEqual(command, (0., 0.))
+        self.assertEqual(follower.state, 'STOP_LATCHED')
+        self.assertEqual(follower.insertion_camera_frame_report['first_intersection']['time_s'], 0.)
+
+    def test_repeating_conflict_at_the_same_pose_stays_latched(self):
+        follower, pose = self.recorded_clearance_hold()
+        for _ in range(5):
+            follower.step(pose, insertion_pose=pose, measured_speed=0., wheels_stopped=True)
+        command = follower.step(pose, insertion_pose=pose, measured_speed=.02756, insertion_yaw_rate=.08376)
+        self.assertEqual(command, (0., 0.))
+        self.assertEqual(follower.state, 'STOP_LATCHED')
+        self.assertEqual(len(follower.clearance_holds), 1)
+
     def test_approach_only_still_arrives_outside_pallet(self):
         follower = self.follower(approach_only=True)
         pose = self.recording['phases'][0]['poses'][0]

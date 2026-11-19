@@ -171,7 +171,8 @@ def stop_session(root,timeout=90.,poll_interval=.05):
         if identity is not None:
             args,started=identity
             expected=str(root/'simulation/run_r3_live_trial.sh').encode()
-            session_modes=(b'--localization-only',b'--nav-to-a',b'--nav-check-only',b'--recognize-here')
+            session_modes=(b'--localization-only',b'--nav-to-a',b'--nav-check-only',b'--recognize-here',
+                           b'--teach-delivery',b'--resume-delivery')
             if (expected not in args or not any(mode in args for mode in session_modes)
                     or ('process_start_ticks' in state and state['process_start_ticks']!=started)):
                 raise RuntimeError('PID không còn thuộc phiên định vị; không gửi tín hiệu.')

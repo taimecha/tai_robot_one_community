@@ -39,9 +39,10 @@ Không mở PlatformIO monitor khi ROS bridge đang dùng `/dev/tai_imu`.
 ## Protocol Serial
 
 - `IMU,1,...`: quaternion, gyro, acceleration và calibration.
-- `LIFT,HOME`: kiểm tra công tắc đáy trước; nếu đã chạm ổn định thì đặt HOME=0 không phát xung. Nếu chưa chạm thì tìm đáy, từ lần chạm đầu hạ thêm đúng 100 bước (1 mm), chờ ổn định rồi đặt vị trí 0.
-- `LIFT,INFO`: trả `INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3`; luồng lấy hàng dùng để kiểm tra cấu hình homing.
+- `LIFT,HOME`: nếu công tắc đáy đã chạm ổn định, đặt HOME=0 tại chỗ. Nếu chưa chạm, dừng phát xung ngay tại cạnh đầu tiên và đợi công tắc xác nhận ổn định. Sau đó hạ đúng 100 bước (1 mm) tính từ cạnh đầu tiên và kiểm tra lại công tắc trước khi đặt HOME=0.
+- `LIFT,INFO`: firmware này trả `INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V4`. Luồng lấy hàng cũng nhận V3.
 - `LIFT,SET,0.02000`: đặt chiều cao tuyệt đối theo mét.
 - `LIFT,STOP`: dừng phát xung.
 - `LIFT,HB`: heartbeat khi HOME.
 - `LIFT,2,...`: phản hồi vị trí, tốc độ, công tắc, số lần HOME đã hoàn thành và cờ bỏ qua chuyển động do công tắc đã chạm. Bridge vẫn đọc được protocol `LIFT,1` cũ.
+- `EVENT,LIFT_HOME_DETAIL,...`: khi lỗi ở lần chạm mới, ghi số bước đã đi từ cạnh đầu, trạng thái raw và đã lọc của công tắc đáy, rồi hai trạng thái của công tắc trên.

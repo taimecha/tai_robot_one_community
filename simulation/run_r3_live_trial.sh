@@ -16,6 +16,10 @@ global_localization=0
 localization_only=0
 camera_obstacles=0
 pickup=0
+retry_home=0
+teach_delivery=0
+deliver_after_pickup=0
+resume_run=''
 while [[ $# -gt 0 ]]; do
 case "$1" in
   --capture-only) capture_only=1; shift ;;
@@ -33,8 +37,13 @@ case "$1" in
   --localization-only) localization_only=1; localization=amcl; shift ;;
   --camera-obstacles) camera_obstacles=1; shift ;;
   --pickup) pickup=1; shift ;;
+  --retry-home) retry_home=1; shift ;;
+  --teach-delivery) teach_delivery=1; localization=amcl; shift ;;
+  --deliver-after-pickup) deliver_after_pickup=1; shift ;;
+  --resume-delivery) [[ $# -ge 2 && $2 != --* ]] || { echo '--resume-delivery cần thư mục lượt đã nâng pallet.' >&2; exit 2; }; resume_run=$2; shift 2 ;;
   --help|-h)
-    echo 'Usage: bash simulation/run_r3_live_trial.sh [--capture-only | --localization-only] [--localization amcl|odom] [--localization-timeout SECONDS] [--map ABS.yaml] [--initial-pose X Y YAW_DEG] [--rviz] [--nav-to-a | --nav-check-only | --recognize-here | --save-a] [--pickup] [--a-file NEW.json] [--global-localization]'
+    echo 'Usage: bash simulation/run_r3_live_trial.sh [--capture-only | --localization-only | --teach-delivery] [--localization amcl|odom] [--localization-timeout SECONDS] [--map ABS.yaml] [--initial-pose X Y YAW_DEG] [--rviz] [--nav-to-a | --nav-check-only | --recognize-here | --save-a] [--pickup [--retry-home] [--deliver-after-pickup]] [--a-file NEW.json] [--global-localization]'
+    echo '       bash simulation/run_r3_live_trial.sh --resume-delivery RUN_DIR [--map ABS.yaml] [--camera-obstacles] [--initial-pose X Y YAW_DEG]'
     echo '--capture-only: chốt RGB-D và lưu bằng chứng; không khởi chạy bộ bám quỹ đạo.'
     echo 'Mặc định: AMCL định vị LiDAR + bản đồ chỉnh sửa; tự tìm toàn bản đồ nếu không có initial-pose/RViz. Dùng --localization odom để chạy theo odom cũ.'
     echo '--localization-timeout: tối đa 120 giây mặc định để định vị trước khi đo/chạy; hết hạn sẽ dừng an toàn.'
@@ -43,12 +52,29 @@ case "$1" in
     echo '--nav-check-only: kiểm tra định vị và Nav2 cho luồng tới A; không gửi goal và không chạy A→C.'
     echo '--recognize-here: định vị LiDAR/bản đồ tại chỗ, bỏ bước Nav2 tới A; đo pallet theo tư thế thực tế rồi hỏi Enter trước khi chạy tới C. Có thể thêm --capture-only để chỉ đo và lưu.'
     echo '--localization-only: LiDAR + AMCL + camera vật cản + global/local costmap + kiểm tra A tại chỗ; Ctrl+C để đóng.'
-    echo '--camera-obstacles: thêm dữ liệu camera vật cản để xem RViz trong lượt thử (không bật YOLO).'
+    echo '--camera-obstacles: hiển thị vật cản RGB-D trên RViz. Với --nav-to-a, mở sau khi xe đến A.'
     echo '--pickup: sau Nav2 tới A (hoặc recognize-here), HOME càng, nhận diện, chạy liên tục A→C→B rồi nâng 8 cm; cần firmware HOME 1 mm mới.'
+    echo '--retry-home: dùng với --pickup sau khi đã nâng càng rời công tắc đáy; thử lại một lần khi ESP32 còn giữ lỗi HOME_SETTLE_LOWER_UNSTABLE của lượt trước.'
+    echo '--teach-delivery: tự định vị, nhận Nav2 Goal từ RViz laptop; tới và dừng rồi chờ xác nhận lưu. Không điều khiển càng.'
+    echo '--deliver-after-pickup: dùng với --pickup; sau khi nâng 8 cm, tự tới D đã lưu và hạ càng khi bánh dừng.'
+    echo '--resume-delivery RUN_DIR: tiếp tục từ lượt đã nâng thành công và dừng trước khi gửi D. Xe tự giao khi càng và định vị hiện tại đã được xác nhận.'
     exit 0 ;;
   *) echo "Tham số không hỗ trợ: $1" >&2; exit 2 ;;
 esac
 done
+[[ $deliver_after_pickup -eq 0 || $pickup -eq 1 ]] || {
+  echo '--deliver-after-pickup cần --pickup.' >&2; exit 2;
+}
+[[ $retry_home -eq 0 || $pickup -eq 1 ]] || {
+  echo '--retry-home cần --pickup.' >&2; exit 2;
+}
+[[ -z $resume_run || ( $localization == amcl && $pickup -eq 0 && $nav_to_a -eq 0 && $recognize_here -eq 0 &&
+                       $teach_delivery -eq 0 && $capture_only -eq 0 && $localization_only -eq 0 && $save_a -eq 0 ) ]] || {
+  echo '--resume-delivery dùng riêng với định vị AMCL.' >&2; exit 2;
+}
+[[ $teach_delivery -eq 0 || ( $pickup -eq 0 && $nav_to_a -eq 0 && $recognize_here -eq 0 && $save_a -eq 0 && $capture_only -eq 0 && $localization_only -eq 0 ) ]] || {
+  echo '--teach-delivery dùng riêng, không kết hợp với lấy hàng/nhận diện/lưu A.' >&2; exit 2;
+}
 [[ $pickup -eq 0 || ( ( $nav_to_a -eq 1 || $recognize_here -eq 1 ) && $nav_check_only -eq 0 && $localization_only -eq 0 && $capture_only -eq 0 && $save_a -eq 0 ) ]] || {
   echo '--pickup cần --nav-to-a hoặc --recognize-here, không dùng với chế độ chỉ kiểm tra/đo/lưu A.' >&2; exit 2;
 }
@@ -64,8 +90,12 @@ if [[ $localization_only -eq 1 ]]; then
 fi
 [[ $nav_to_a -eq 0 || $save_a -eq 0 ]] || { echo 'Chọn --nav-to-a hoặc --save-a' >&2; exit 2; }
 [[ $nav_to_a -eq 0 || $capture_only -eq 0 ]] || { echo '--capture-only không đi Nav2; bỏ --nav-to-a' >&2; exit 2; }
-if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 || $save_a -eq 1 ]]; then
+if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 || $save_a -eq 1 || $teach_delivery -eq 1 ]]; then
   localization=amcl
+fi
+shared_navigation=0
+if [[ $nav_to_a -eq 1 && $deliver_after_pickup -eq 1 ]]; then
+  shared_navigation=1
 fi
 if [[ $localization == amcl && ${#initial_pose_args[@]} -eq 0 && $use_rviz -eq 0 ]]; then
   global_localization=1
@@ -98,12 +128,21 @@ fi
 if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
   python3 simulation/r3_recognition_goal.py inspect --map "$map_file" --goal "$goal_file"
 fi
+if [[ $deliver_after_pickup -eq 1 ]]; then
+  python3 simulation/r3_delivery_mission.py inspect --map "$map_file"
+fi
+if [[ -n $resume_run ]]; then
+  resume_run=$(realpath -e -- "$resume_run")
+  pickup_to_resume="$resume_run/trial/mission_result.json"
+  python3 simulation/r3_delivery_mission.py inspect --map "$map_file" --goal "$resume_run/delivery_goal.json" \
+    --pickup-result "$pickup_to_resume" --resume-delivery
+fi
 
 for device in /dev/tai_drive /dev/tai_imu /dev/tai_lidar; do
   [[ -e "$device" ]] || { echo "Thiếu thiết bị $device" >&2; exit 1; }
 done
 [[ -x camera/detect_astra/.venv/bin/python ]] || { echo 'Thiếu Python camera' >&2; exit 1; }
-[[ $localization_only -eq 1 || -d camera/detect_astra/data/runtime_models/best_v3_ncnn_model ]] || {
+[[ $localization_only -eq 1 || $teach_delivery -eq 1 || -n $resume_run || -d camera/detect_astra/data/runtime_models/best_v3_ncnn_model ]] || {
   echo 'Thiếu model NCNN pallet' >&2; exit 1;
 }
 
@@ -114,6 +153,13 @@ flock -n 9 || { echo 'Đã có một lượt r3 đang chạy' >&2; exit 1; }
 # foreground Python/tee process must not retain fd 9 after the owner exits.
 run_dir=$(mktemp -d "$root/simulation/output/r3_live/$(date +%Y%m%d_%H%M%S)_XXXXXX")
 plan="$run_dir/plan/frozen_plan.json"
+delivery_goal="$run_dir/delivery_goal.json"
+if [[ $deliver_after_pickup -eq 1 ]]; then
+  python3 9>&- simulation/r3_delivery_mission.py inspect --map "$map_file" --output "$delivery_goal"
+elif [[ -n $resume_run ]]; then
+  python3 9>&- simulation/r3_delivery_mission.py inspect --map "$map_file" --goal "$resume_run/delivery_goal.json" \
+    --pickup-result "$pickup_to_resume" --resume-delivery --output "$delivery_goal"
+fi
 camera_pid=''
 bringup_pid=''
 perception_pid=''
@@ -124,10 +170,12 @@ control_odom_pid=''
 global_initializer_pid=''
 rviz_pid=''
 navigation_pid=''
+navigation_nodes=(controller_server planner_server behavior_server velocity_smoother collision_monitor bt_navigator)
 camera_obstacles_pid=''
 navigation_telemetry_pid=''
 inspection_costmaps_pid=''
 a_watch_pid=''
+delivery_pid=''
 
 group_running() {
   local group=$1
@@ -162,7 +210,7 @@ start_perception() {
   if [[ -n "$perception_pid" ]] && kill -0 "$perception_pid" 2>/dev/null; then
     return 0
   fi
-  echo 'Nạp sẵn model YOLO; nhận diện và tracking đang tạm dừng tới khi xe ở A.'
+  echo 'Nạp model YOLO ở chế độ tạm dừng trước khi bắt đầu nhận diện.'
   setsid 9>&- bash camera/detect_astra/scripts/open_pallet_target.sh \
     --model camera/detect_astra/data/runtime_models/best_v3_ncnn_model \
     --measurement-bias-yaml camera/detect_astra/config/calibration/pallet_target_bias_robot_2026_11_11.yaml \
@@ -172,29 +220,87 @@ start_perception() {
   perception_pid=$!
 }
 
+start_camera_obstacles() {
+  [[ $camera_obstacles -eq 1 ]] || return 0
+  echo 'Mở vật cản RGB-D dùng chung hiệu chỉnh độ sâu với đo pallet: /camera/obstacle_scan (chấm vàng sẫm).'
+  local floor_alignment=false
+  [[ $localization_only -eq 0 ]] || floor_alignment=true
+  setsid 9>&- ros2 launch camera/detect_astra/launch/r3_existing_camera_obstacles.launch.py \
+    floor_alignment:="$floor_alignment" floor_alignment_report:="$run_dir/camera_floor_alignment.json" \
+    >"$run_dir/camera_obstacles.log" 2>&1 &
+  camera_obstacles_pid=$!
+}
+
+wait_navigation_active() {
+  local log_file=$1
+  python3 9>&- simulation/r3_wait_localization_active.py --timeout 60 \
+    --nodes "${navigation_nodes[@]}" \
+    --startup-log "$log_file" \
+    2>&1 | tee 9>&- -a "$run_dir/navigation_activation.log"
+}
+
+navigation_transition() {
+  python3 9>&- simulation/r3_wait_localization_active.py --timeout 20 \
+    --nodes "${navigation_nodes[@]}" --navigation-transition "$1" \
+    2>&1 | tee 9>&- -a "$run_dir/navigation_activation.log"
+}
+
 start_navigation() {
+  local loaded=${1:-false}
   local attempt
+  local logfile="$run_dir/navigation.log"
+  local archive="$run_dir/navigation_attempt"
+  local navigation_options=()
+  [[ $teach_delivery -eq 0 ]] || navigation_options+=(delivery_teaching:=true)
+  if [[ $loaded == true ]]; then
+    navigation_options+=(loaded_delivery:=true)
+    logfile="$run_dir/navigation_D.log"
+    archive="$run_dir/navigation_D_attempt"
+  elif [[ $shared_navigation -eq 1 ]]; then
+    navigation_options+=(shared_navigation:=true)
+  fi
   for attempt in 1 2 3; do
     echo "Khởi động Nav2 (lần $attempt/3); chưa gửi goal chuyển động."
-    setsid 9>&- ros2 launch camera/detect_astra/launch/r3_navigation.launch.py \
-      >"$run_dir/navigation.log" 2>&1 &
+    setsid 9>&- ros2 launch camera/detect_astra/launch/r3_navigation.launch.py "${navigation_options[@]}" \
+      >"$logfile" 2>&1 &
     navigation_pid=$!
-    if python3 9>&- simulation/r3_wait_localization_active.py --timeout 60 \
-        --nodes controller_server planner_server behavior_server velocity_smoother collision_monitor bt_navigator \
-        --startup-log "$run_dir/navigation.log" \
-        2>&1 | tee 9>&- -a "$run_dir/navigation_activation.log"; then
+    if wait_navigation_active "$logfile"; then
       return 0
     fi
     stop_owned "$navigation_pid"
     navigation_pid=''
-    mv "$run_dir/navigation.log" "$run_dir/navigation_attempt_${attempt}.log"
+    mv "$logfile" "${archive}_${attempt}.log"
     if [[ $attempt -lt 3 ]]; then
       echo 'Nav2 khởi động lỗi dịch vụ; đã đóng nhóm lỗi và tự thử lại, giữ nguyên AMCL và kết quả khớp bản đồ.' >&2
       sleep 1
     fi
   done
-  echo "Không kích hoạt được Nav2 sau 3 lần; xem $run_dir/navigation_attempt_*.log. Chưa gửi goal." >&2
+  echo "Không kích hoạt được Nav2 sau 3 lần; xem ${archive}_*.log. Chưa gửi goal." >&2
   return 2
+}
+
+deliver_pallet() {
+  local pickup_result=$1
+  shift
+  local delivery_args=(--map "$map_file" --goal "$delivery_goal" --pickup-result "$pickup_result" "$@")
+  if [[ $shared_navigation -eq 1 ]]; then
+    echo 'Tiếp tục cùng phiên Nav2 để giao tới D.'
+    if ! kill -0 "$navigation_pid" 2>/dev/null || ! navigation_transition resume; then
+      echo 'Phiên Nav2 đang giữ không phục hồi được. Khởi động lại cho chặng D.' >&2
+      stop_owned "$navigation_pid"
+      navigation_pid=''
+      start_navigation true
+    fi
+  else
+    start_navigation true
+  fi
+  python3 9>&- simulation/r3_delivery_mission.py navigate "${delivery_args[@]}" \
+    --handoff-output "$run_dir/delivery_handoff.json" --output "$run_dir/delivery_arrival.json"
+  stop_owned "$navigation_pid"
+  navigation_pid=''
+  python3 9>&- simulation/r3_delivery_mission.py lower "${delivery_args[@]}" \
+    --arrival "$run_dir/delivery_arrival.json" --output "$run_dir/delivery_result.json"
+  echo 'Đã tới D và hoàn tất hạ càng theo phản hồi ESP32. Xe đứng tại D.'
 }
 
 wait_for_localization() {
@@ -229,12 +335,13 @@ localization_nodes_running() {
 cleanup() {
   local result=$?
   trap - EXIT
+  stop_owned "$navigation_pid"
   if [[ $pickup -eq 1 && -n "$bringup_pid" ]]; then
     python3 9>&- simulation/r3_lift_control.py stop --execute >"$run_dir/lift_stop.log" 2>&1 || true
   fi
   stop_owned "$global_initializer_pid"
   stop_owned "$safety_pid"
-  stop_owned "$navigation_pid"
+  stop_owned "$delivery_pid"
   stop_owned "$a_watch_pid"
   stop_owned "$inspection_costmaps_pid"
   stop_owned "$camera_obstacles_pid"
@@ -270,10 +377,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-if [[ $localization_only -eq 1 || $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
+if [[ $localization_only -eq 1 || $nav_to_a -eq 1 || $recognize_here -eq 1 || $teach_delivery -eq 1 || -n $resume_run ]]; then
   session_mode=stationary_inspection
   if [[ $nav_to_a -eq 1 ]]; then session_mode=navigation_to_A; fi
   if [[ $recognize_here -eq 1 ]]; then session_mode=recognition_here; fi
+  if [[ $teach_delivery -eq 1 ]]; then session_mode=delivery_teaching; fi
+  if [[ -n $resume_run ]]; then session_mode=delivery_resume; fi
   python3 9>&- - "$run_dir" "$map_file" "$$" "$session_mode" <<'PY'
 import json,sys
 from pathlib import Path
@@ -327,7 +436,7 @@ if [[ $localization == amcl ]]; then
   inspection_profile=false
   [[ $localization_only -eq 0 ]] || inspection_profile=true
   precision_profile=$inspection_profile
-  [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]] || precision_profile=true
+  [[ $nav_to_a -eq 0 && $recognize_here -eq 0 && $teach_delivery -eq 0 && -z $resume_run ]] || precision_profile=true
   for localization_attempt in 1 2; do
     setsid 9>&- ros2 launch camera/detect_astra/launch/r3_localization.launch.py map_file:="$map_file" \
       stationary_inspection:="$inspection_profile" \
@@ -371,24 +480,30 @@ if [[ $localization == amcl ]]; then
     global_initializer_pid=''
     global_args=(--global-seed-ready)
   fi
-  if [[ $nav_to_a -eq 1 ]]; then
+  if [[ $nav_to_a -eq 1 || $teach_delivery -eq 1 ]]; then
     # Configure and activate Nav2 before the single parked AMCL refresh. Its
     # startup load must not interrupt the localization evidence being taught.
     start_navigation
     if [[ $nav_check_only -eq 0 ]]; then
+      telemetry_args=()
+      [[ $shared_navigation -eq 0 ]] || telemetry_args+=(--shared-navigation)
       setsid 9>&- python3 simulation/r3_navigation_telemetry.py --output "$run_dir/navigation_motion.jsonl" \
+        "${telemetry_args[@]}" \
         >"$run_dir/navigation_telemetry.log" 2>&1 &
       navigation_telemetry_pid=$!
     fi
   fi
   [[ $localization_only -eq 0 ]] || global_args+=(--stationary-inspection)
-  [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]] || global_args+=(--continuous-localization --navigation-monitor --external-control-odom)
+  [[ $nav_to_a -eq 0 && $recognize_here -eq 0 && $teach_delivery -eq 0 && -z $resume_run ]] || global_args+=(--continuous-localization --navigation-monitor --external-control-odom)
+  [[ -z $resume_run ]] || global_args+=(--resume-delivery)
   setsid 9>&- python3 simulation/r3_amcl_bridge.py --map "$map_file" \
     --wait-ready "$run_dir/localization_ready.json" "${initial_pose_args[@]}" "${global_args[@]}" \
     >"$run_dir/localization_bridge.log" 2>&1 &
   localization_bridge_pid=$!
   if [[ $use_rviz -eq 1 ]]; then
-    setsid 9>&- rviz2 -d "$root/ros2_ws/config/localization_real.rviz" >"$run_dir/rviz.log" 2>&1 &
+    rviz_config="$root/ros2_ws/config/localization_real.rviz"
+    [[ $teach_delivery -eq 0 ]] || rviz_config="$root/ros2_ws/config/r3_laptop.rviz"
+    setsid 9>&- rviz2 -d "$rviz_config" >"$run_dir/rviz.log" 2>&1 &
     rviz_pid=$!
   fi
   if [[ $global_localization -eq 1 ]]; then
@@ -403,14 +518,32 @@ if [[ $localization == amcl ]]; then
   fi
 fi
 
-if [[ $camera_obstacles -eq 1 ]]; then
-  echo 'Mở vật cản RGB-D dùng chung hiệu chỉnh độ sâu với đo pallet: /camera/obstacle_scan (chấm vàng sẫm).'
-  floor_alignment=false
-  [[ $localization_only -eq 0 ]] || floor_alignment=true
-  setsid 9>&- ros2 launch camera/detect_astra/launch/r3_existing_camera_obstacles.launch.py \
-    floor_alignment:="$floor_alignment" floor_alignment_report:="$run_dir/camera_floor_alignment.json" \
-    >"$run_dir/camera_obstacles.log" 2>&1 &
-  camera_obstacles_pid=$!
+# Nav2 to A uses LiDAR. Start the optional RGB-D processing after that leg
+# and HOME so its startup load does not compete with the odom/TF handoff.
+if [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]]; then
+  start_camera_obstacles
+fi
+
+if [[ -n $resume_run ]]; then
+  echo 'Tiếp tục chuyến giao hàng với pallet đã nâng. Đang kiểm tra xe và vị trí hiện tại.'
+  deliver_pallet "$pickup_to_resume" --resume-delivery
+  exit 0
+fi
+
+if [[ $teach_delivery -eq 1 ]]; then
+  setsid 9>&- python3 simulation/r3_delivery_goal.py serve --map "$map_file" \
+    --output "$run_dir/delivery_status.json" >"$run_dir/delivery.log" 2>&1 &
+  delivery_pid=$!
+  echo 'Giữ cửa sổ RViz laptop hiện có. Khi DELIVERY: READY_FOR_GOAL, chọn Nav2 Goal và kéo hướng xe.'
+  echo 'Sau khi xe tới/dừng, chỉ lưu khi người vận hành xác nhận “lưu”; không tự lưu hoặc điều khiển càng.'
+  echo "Trạng thái: $run_dir/delivery_status.json"
+  while kill -0 "$localization_pid" 2>/dev/null && kill -0 "$localization_bridge_pid" 2>/dev/null \
+      && kill -0 "$bringup_pid" 2>/dev/null && kill -0 "$navigation_pid" 2>/dev/null \
+      && kill -0 "$delivery_pid" 2>/dev/null; do
+    sleep 1
+  done
+  echo 'Một tiến trình giao hàng đã dừng; xem delivery.log/navigation.log/localization_bridge.log.' >&2
+  exit 1
 fi
 
 if [[ $localization_only -eq 1 ]]; then
@@ -439,18 +572,16 @@ if [[ $save_a -eq 1 ]]; then
   exit 0
 fi
 
-if [[ $nav_check_only -eq 0 ]]; then
-  start_perception
-fi
-
 if [[ $nav_to_a -eq 1 ]]; then
   echo "Nav2 sẽ đi tới A mới trong: $goal_file"
+  navigation_args=(--continuous-localization)
+  [[ $shared_navigation -eq 0 ]] || navigation_args+=(--shared-navigation)
   if [[ $nav_check_only -eq 0 ]]; then
     # Show the actual current estimate before authorizing motion. A small
     # map-position error can place A behind a forward-only skid-steer robot.
     if ! python3 9>&- simulation/r3_recognition_goal.py navigate --map "$map_file" \
         --goal "$goal_file" --output "$run_dir/navigation_start_check.json" \
-        --continuous-localization --check-only >"$run_dir/navigation_start_check.log" 2>&1; then
+        "${navigation_args[@]}" --check-only >"$run_dir/navigation_start_check.log" 2>&1; then
       cat "$run_dir/navigation_start_check.log" >&2
       exit 2
     fi
@@ -459,7 +590,6 @@ if [[ $nav_to_a -eq 1 ]]; then
   fi
   # Keep the sensor-only localization monitor throughout Nav2 transit. It
   # never publishes control odometry and does not impose short A->C bounds.
-  navigation_args=(--continuous-localization)
   navigation_report="$run_dir/navigation_to_A.json"
   if [[ $nav_check_only -eq 1 ]]; then
     navigation_args+=(--check-only)
@@ -474,11 +604,16 @@ elif [[ $recognize_here -eq 1 ]]; then
     --continuous-localization --recognize-here
 fi
 if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
-  # Nav2 must fully release all velocity publishers before the r3 monitor
-  # and fixed path follower are started. No concurrent command ownership.
+  # A's relay has exited. The shared Nav2 instance uses only private topics
+  # and is paused during docking and lift so it leaves the Pi time to control.
   if [[ $nav_to_a -eq 1 ]]; then
-    stop_owned "$navigation_pid"
-    navigation_pid=''
+    if [[ $shared_navigation -eq 1 ]] && navigation_transition pause; then
+      echo 'Đã tạm ngưng Nav2 để lấy pallet, giữ phiên cho chặng D.'
+    else
+      shared_navigation=0
+      stop_owned "$navigation_pid"
+      navigation_pid=''
+    fi
     if [[ -n ${navigation_telemetry_pid:-} ]]; then
       stop_owned "$navigation_telemetry_pid"
       navigation_telemetry_pid=''
@@ -512,9 +647,14 @@ if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
 fi
 
 if [[ $pickup -eq 1 ]]; then
-  python3 9>&- simulation/r3_lift_control.py home --execute 2>&1 | tee 9>&- "$run_dir/lift_home.log"
+  home_args=(--execute --telemetry "$run_dir/lift_home_telemetry.jsonl")
+  [[ $retry_home -eq 0 ]] || home_args+=(--retry-home)
+  python3 9>&- simulation/r3_lift_control.py home "${home_args[@]}" 2>&1 | tee 9>&- "$run_dir/lift_home.log"
 fi
 
+if [[ $nav_to_a -eq 1 || $recognize_here -eq 1 ]]; then
+  start_camera_obstacles
+fi
 echo 'Bắt đầu nhận diện YOLO và đo pallet RGB-D mới tại A...'
 start_perception
 perception_restarts=0
@@ -576,6 +716,7 @@ kill -0 "$safety_pid" 2>/dev/null || { echo 'Bộ dừng vật cản đã dừng
 
 trial_mode=(--arrive-at-c)
 [[ $pickup -eq 0 ]] || trial_mode=(--pickup)
+[[ $deliver_after_pickup -eq 0 ]] || trial_mode+=(--deliver-after-pickup)
 set +e
 python3 9>&- simulation/r3_real_trial.py --plan "$plan" --output "$run_dir/trial" \
   --allow-provisional --execute "${trial_mode[@]}" 2>&1 | tee 9>&- "$run_dir/trial.log"
@@ -590,6 +731,15 @@ mission_status=$(python3 9>&- -c 'import json,sys; print(json.load(open(sys.argv
   "$run_dir/trial/mission_result.json")
 if [[ "$mission_status" == PICKUP_COMPLETE ]]; then
   echo 'Đã chạy A→C→B, dừng bánh tại B và nâng càng lên 8 cm theo phản hồi ESP32.'
+  if [[ $deliver_after_pickup -eq 1 ]]; then
+    stop_owned "$safety_pid"
+    safety_pid=''
+    stop_owned "$control_odom_pid"
+    control_odom_pid=''
+    stop_owned "$perception_pid"
+    perception_pid=''
+    deliver_pallet "$run_dir/trial/mission_result.json"
+  fi
 elif [[ "$mission_status" == C_ARRIVED ]]; then
   echo 'Đã hoàn thành A→C và dừng tại C; chưa đưa càng vào hoặc nâng pallet.'
 elif [[ "$mission_status" == C_ALIGNMENT_WARNING ]]; then

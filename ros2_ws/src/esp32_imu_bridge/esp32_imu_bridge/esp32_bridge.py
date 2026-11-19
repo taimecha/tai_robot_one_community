@@ -18,7 +18,8 @@ from serial import SerialException
 from std_msgs.msg import Empty, Float64MultiArray, String
 
 
-LIFT_FIRMWARE_PROFILE = 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3'
+LIFT_FIRMWARE_PROFILE = 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V4'
+SUPPORTED_LIFT_FIRMWARE = {LIFT_FIRMWARE_PROFILE, 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3'}
 LIFT_INFO_QUERY_INTERVAL_S = 1.0
 LIFT_INFO_MAX_ATTEMPTS = 8
 
@@ -258,7 +259,7 @@ class ESP32ImuBridge(Node):
             position_commands_ready=not self.lift_command_quiet_required,
             firmware_profile=self.lift_firmware_profile,
             firmware_info=dict(
-                state=('confirmed' if self.lift_firmware_profile == LIFT_FIRMWARE_PROFILE else
+                state=('confirmed' if self.lift_firmware_profile in SUPPORTED_LIFT_FIRMWARE else
                        'incompatible' if self.lift_firmware_profile is not None else
                        'timeout' if self.lift_info_query_attempts >= LIFT_INFO_MAX_ATTEMPTS else
                        'pending'),
@@ -492,15 +493,23 @@ class ESP32ImuBridge(Node):
                 raise FrameError('invalid lift firmware identity')
             profile = fields[2]
             if profile != self.lift_firmware_profile:
-                if profile == LIFT_FIRMWARE_PROFILE:
+                if profile in SUPPORTED_LIFT_FIRMWARE:
                     self.get_logger().info('Lift firmware confirmed: '+profile)
                 else:
                     self.get_logger().warning('Incompatible lift firmware: '
-                        +profile+'; required '+LIFT_FIRMWARE_PROFILE)
+                        +profile+'; expected V3 or V4 HOME profile')
             self.lift_firmware_profile = profile
             return
         if line.startswith('STATUS:'):
             self.log_throttled('info', f'ESP32: {line}')
+            return
+        # A single shared throttle must not hide a HOME fault or its details
+        # after logging the immediately preceding START/CONTACT event.
+        if line.startswith(('EVENT,LIFT_FAULT,', 'EVENT,LIFT_STOPPED,COMM_TIMEOUT')):
+            self.get_logger().error(f'ESP32: {line}')
+            return
+        if line.startswith('EVENT,LIFT_HOME_'):
+            self.get_logger().info(f'ESP32: {line}')
             return
         if line.startswith('EVENT,'):
             self.log_throttled('info', f'ESP32: {line}')

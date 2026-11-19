@@ -23,9 +23,9 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from r3_scan_map_check import validate_recognition_scan_match
 from r3_amcl_quality import validate_runtime_particles
+from r3_delivery_topics import VELOCITY_TOPICS
 
 
-VELOCITY_TOPICS=('/cmd_vel_nav','/cmd_vel_localized','/cmd_vel_smoothed','/cmd_vel_safe')
 MAX_SERVICE_ATTEMPTS=3
 MIN_RETRY_INTERVAL_S=.25
 SOURCE_FIELDS=('run_id','map_file','amcl_stamp_s','cloud_stamp_s','map_pose_xyyaw',
@@ -56,7 +56,7 @@ def snapshot_digest(snapshot):
     return hashlib.sha256(json.dumps(source,sort_keys=True,allow_nan=False).encode()).hexdigest()
 
 
-def validate_source(status,map_file,now):
+def validate_source(status,map_file,now,*,validate_scan=validate_recognition_scan_match):
     """Bind the request to a fresh parked monitor in the selected map/run."""
     if not isinstance(status,dict) or not fresh(status.get('published_ros_s'),now,.5):
         raise ValueError('localization status is missing/stale')
@@ -87,7 +87,7 @@ def validate_source(status,map_file,now):
     if (not isinstance(fit,dict) or fit.get('ready') is not True
             or not fresh(fit.get('scan_stamp_s'),now,.5)):
         raise ValueError('handoff requires fresh scan/map agreement')
-    validate_recognition_scan_match(fit)
+    validate_scan(fit)
     _pose(snapshot.get('map_odom_xyyaw'),'original map/odom pose')
     _pose(status.get('current_map_odom_xyyaw'),'current map/odom pose')
     snapshot_digest(snapshot)

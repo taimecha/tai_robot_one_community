@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, retrying read-only lifecycle checks before navigation is allowed."""
+"""Check lifecycle states and pause or resume the existing Nav2 nodes."""
 import argparse
 import math
 from pathlib import Path
@@ -7,6 +7,7 @@ import time
 
 import rclpy
 from lifecycle_msgs.srv import GetState
+from nav2_msgs.srv import ManageLifecycleNodes
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 
@@ -17,8 +18,9 @@ STARTUP_FAILURE_MARKERS=('Failed to bring up all requested nodes',
                          'Failed to change state for node:')
 
 
-def readiness(states, now, max_age_s=2.5, *, names=NAMES):
-    """Require a fresh successful ACTIVE response from both named services."""
+def readiness(states, now, max_age_s=2.5, *, names=NAMES, expected_state=3):
+    """Require a recent response in the expected state from every node."""
+    label='ACTIVE' if expected_state==3 else 'INACTIVE'
     for name in names:
         state=states.get(name,{})
         if state.get('error'):
@@ -26,9 +28,9 @@ def readiness(states, now, max_age_s=2.5, *, names=NAMES):
         stamp=state.get('stamp')
         if not isinstance(stamp,(int,float)) or not math.isfinite(stamp) or not 0<=now-stamp<=max_age_s:
             return False,f'{name}: missing/stale lifecycle response'
-        if state.get('id')!=3:
-            return False,f'{name}: lifecycle state {state.get("id")} is not ACTIVE (3)'
-    return True,' and '.join(names)+' lifecycle ACTIVE'
+        if state.get('id')!=expected_state:
+            return False,f'{name}: lifecycle state {state.get("id")} is not {label} ({expected_state})'
+    return True,' and '.join(names)+' lifecycle '+label
 
 
 class LifecyclePoll:
@@ -108,9 +110,10 @@ def startup_failure(log_path):
 
 
 def wait_active(poll, timeout, spin, *, clock=time.monotonic, ok=rclpy.ok, report=print,
-                startup_log=None):
+                startup_log=None, expected_state=3):
     deadline=clock()+timeout
     last_reason=None
+    waiting='Waiting for Nav2 to pause: ' if expected_state==2 else 'Waiting for localization activation: '
     while ok() and clock()<deadline:
         failure=startup_failure(startup_log)
         if failure is not None:
@@ -118,16 +121,29 @@ def wait_active(poll, timeout, spin, *, clock=time.monotonic, ok=rclpy.ok, repor
             return False
         wall=clock()
         poll.tick(wall)
-        ready,reason=readiness(poll.states,wall,names=tuple(poll.clients))
+        ready,reason=readiness(poll.states,wall,names=tuple(poll.clients),expected_state=expected_state)
         if ready:
             report(reason)
             return True
         if reason!=last_reason:
-            report('Waiting for localization activation: '+reason)
+            report(waiting+reason)
             last_reason=reason
         spin(min(.05,max(0.,deadline-clock())))
-    report('Localization activation timed out/stopped: '+str(last_reason))
+    report(waiting+'timed out or stopped: '+str(last_reason))
     return False
+
+
+def navigation_transition(node, executor, transition, deadline):
+    client=node.create_client(ManageLifecycleNodes,'/lifecycle_manager_navigation/manage_nodes')
+    remaining=max(0.,deadline-time.monotonic())
+    if not client.wait_for_service(timeout_sec=remaining):
+        raise RuntimeError('Không tìm thấy dịch vụ lifecycle của Nav2.')
+    request=ManageLifecycleNodes.Request()
+    request.command=request.PAUSE if transition=='pause' else request.RESUME
+    future=client.call_async(request)
+    executor.spin_until_future_complete(future,timeout_sec=max(0.,deadline-time.monotonic()))
+    if not future.done() or future.result() is None or not future.result().success:
+        raise RuntimeError('Nav2 không xác nhận thao tác '+transition)
 
 
 def main():
@@ -137,6 +153,7 @@ def main():
                         help='Lifecycle node names whose ACTIVE state is required')
     parser.add_argument('--startup-log',type=Path,
                         help='Exit early if this attempt\'s lifecycle manager aborts bringup')
+    parser.add_argument('--navigation-transition',choices=('pause','resume'))
     args=parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout<=0:
         parser.error('--timeout must be finite and positive')
@@ -148,14 +165,22 @@ def main():
     executor=SingleThreadedExecutor()
     executor.add_node(node)
     try:
+        deadline=time.monotonic()+args.timeout
+        if args.navigation_transition:
+            navigation_transition(node,executor,args.navigation_transition,deadline)
         def recreate(name,client):
             node.destroy_client(client)
             return node.create_client(GetState,f'/{name}/get_state')
         poll=LifecyclePoll({name:node.create_client(GetState,f'/{name}/get_state') for name in names},
                            poll_period_s=.5,recreate_client=recreate)
-        active=wait_active(poll,args.timeout,lambda seconds:executor.spin_once(timeout_sec=seconds),
-                           report=lambda message:print(message,flush=True),startup_log=args.startup_log)
+        active=wait_active(poll,max(0.,deadline-time.monotonic()),
+                           lambda seconds:executor.spin_once(timeout_sec=seconds),
+                           report=lambda message:print(message,flush=True),startup_log=args.startup_log,
+                           expected_state=2 if args.navigation_transition=='pause' else 3)
         return 0 if active else 2
+    except RuntimeError as exc:
+        print(str(exc),flush=True)
+        return 2
     except KeyboardInterrupt:
         return 2
     finally:

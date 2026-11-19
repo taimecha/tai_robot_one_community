@@ -15,6 +15,7 @@ from nav_msgs.msg import Odometry,Path as NavPath
 from sensor_msgs.msg import Imu,LaserScan
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
+from r3_delivery_topics import delivery_velocity
 
 
 def finite(value):
@@ -22,7 +23,7 @@ def finite(value):
 
 
 class NavigationTelemetry(Node):
-    def __init__(self,output):
+    def __init__(self,output,shared_navigation=False):
         super().__init__('r3_navigation_telemetry')
         output.parent.mkdir(parents=True,exist_ok=True)
         self.file=output.open('w',buffering=65536);self.latest={};self.ticks=0
@@ -31,7 +32,8 @@ class NavigationTelemetry(Node):
         self.file.write(json.dumps(dict(schema='r3_navigation_motion_v2',
             observer_only=True,robot_commands_from_this_process=0))+'\n')
         for topic in ['/cmd_vel_nav','/cmd_vel_nav_checked','/cmd_vel_smoothed','/cmd_vel_safe']:
-            self.create_subscription(Twist,topic,
+            wire_topic=delivery_velocity(topic) if shared_navigation and topic!='/cmd_vel_safe' else topic
+            self.create_subscription(Twist,wire_topic,
                 lambda m,t=topic:self.command(t,m),qos_profile_sensor_data)
         self.create_subscription(TwistStamped,'/base_controller/cmd_vel_out',
             lambda m:self.command('/base_controller/cmd_vel_out',m.twist,self.stamp(m)),qos_profile_sensor_data)
@@ -125,8 +127,10 @@ class NavigationTelemetry(Node):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
-    rclpy.init();node=NavigationTelemetry(args.output)
+    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--shared-navigation',action='store_true')
+    args=parser.parse_args()
+    rclpy.init();node=NavigationTelemetry(args.output,args.shared_navigation)
     try:rclpy.spin(node)
     except (KeyboardInterrupt,ExternalShutdownException):pass
     finally:

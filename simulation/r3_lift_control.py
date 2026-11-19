@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+from pathlib import Path
 import time
 
 import rclpy
@@ -11,8 +12,13 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Empty, Float64MultiArray, String
 
-FIRMWARE_PROFILE = 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3'
+FIRMWARE_PROFILE = 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V4'
+SUPPORTED_FIRMWARE_PROFILES = {FIRMWARE_PROFILE, 'HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3'}
+HOME_RETRY_FAULT = 'HOME_SETTLE_LOWER_UNSTABLE'
 STATUS_TIMEOUT_S = .5
+# HOME sits 1 mm beyond the lower-switch trigger. Stop above that switch in
+# normal position mode. The approved fork top then sits 24 mm below the deck.
+DELIVERY_HEIGHT_M = .002
 
 
 class HomeBaseGuard:
@@ -93,9 +99,11 @@ class LiftControl:
         self.sample_ms = None
         self.error = ''
         self.home_seen = False
+        self.retrying_home = False
         self.home_generation_before = 0
         self.requested_at = None
         self.raise_started = None
+        self.lower_started = None
         self.height = None
         self.set_commands = 0
         self.home_commands = 0
@@ -135,7 +143,7 @@ class LiftControl:
                 if not isinstance(value.get(key), bool):
                     raise ValueError('invalid lift '+key)
             generation = value.get('home_completion_count')
-            if value.get('firmware_profile') == FIRMWARE_PROFILE and (
+            if value.get('firmware_profile') in SUPPORTED_FIRMWARE_PROFILES and (
                     isinstance(generation, bool) or not isinstance(generation, int)
                     or not 0 <= generation <= 0xFFFFFFFF):
                 raise ValueError('missing/invalid lift HOME acknowledgement')
@@ -147,7 +155,7 @@ class LiftControl:
             self.value = None
             self.received = 0.
 
-    def status(self):
+    def fresh_feedback(self):
         if self.error:
             raise ValueError(self.error)
         value = self.value
@@ -159,10 +167,31 @@ class LiftControl:
         profile = value.get('firmware_profile')
         if profile in (None, ''):
             raise ValueError('lift firmware identity not received; waiting for LIFT,INFO response')
-        if profile != FIRMWARE_PROFILE:
-            raise ValueError('incompatible lift firmware '+repr(profile)+'; required '+FIRMWARE_PROFILE)
+        if profile not in SUPPORTED_FIRMWARE_PROFILES:
+            raise ValueError('incompatible lift firmware '+repr(profile)+'; expected V3 or V4 HOME profile')
+        return value
+
+    @staticmethod
+    def check_status(value):
         if value.get('state') not in ('UNHOMED', 'IDLE', 'HOMING', 'MOVING') or value.get('fault') != 'NONE':
             raise ValueError('lift fault: '+str(value.get('fault', value.get('state'))))
+
+    def status(self):
+        value = self.fresh_feedback()
+        self.check_status(value)
+        return value
+
+    def home_preflight(self, *, retry_home=False):
+        value = self.fresh_feedback()
+        if (value.get('firmware_profile') == FIRMWARE_PROFILE
+                and value.get('state') == 'UNHOMED' and value.get('fault') == HOME_RETRY_FAULT):
+            if not retry_home:
+                raise ValueError(f'lift fault: {HOME_RETRY_FAULT}; sau khi nâng càng rời công tắc đáy, '
+                                 'dùng --retry-home để thử lại một lần')
+            if value['homed'] or value['lower_active'] or value['upper_active'] or abs(value['velocity']) > .0005:
+                raise ValueError('HOME retry requires an unhomed, stationary lift with both switches released')
+        else:
+            self.check_status(value)
         return value
 
     def check_owners(self):
@@ -189,17 +218,29 @@ class LiftControl:
             raise ValueError('lift must be homed and stationary at zero before insertion')
         return value
 
-    def home(self):
-        value = self.status()
+    def home(self, *, retry_home=False):
+        value = self.home_preflight(retry_home=retry_home)
         self.check_owners()
         self.requested_at = time.monotonic()
         self.home_seen = False
+        self.retrying_home = value.get('fault') == HOME_RETRY_FAULT
         self.home_generation_before = value['home_completion_count']
         self.home_pub.publish(Empty())
         self.home_commands += 1
 
     def home_complete(self):
-        value = self.status()
+        value = self.fresh_feedback()
+        # V4 can retain the old fault string through HOMING after a STOP.
+        # A new fault switches to FAULT and must immediately abort the retry.
+        waiting_for_start = not self.home_seen and value.get('state') == 'UNHOMED'
+        retained_fault = (self.retrying_home and value.get('firmware_profile') == FIRMWARE_PROFILE
+                          and value.get('fault') == HOME_RETRY_FAULT
+                          and value['home_completion_count'] == self.home_generation_before
+                          and not value['homed'] and not value['upper_active']
+                          and (value.get('state') == 'HOMING' or (waiting_for_start
+                               and not value['lower_active'] and abs(value['velocity']) <= .0005)))
+        if not retained_fault:
+            self.check_status(value)
         now = time.monotonic()
         completed = 0 < ((value['home_completion_count']-self.home_generation_before) & 0xFFFFFFFF) < 0x80000000
         if now-self.requested_at > 70. or (not self.home_seen and not completed and now-self.requested_at > 3.):
@@ -207,6 +248,8 @@ class LiftControl:
         if not completed or value['state'] == 'HOMING':
             return False
         self.at_home(require_lower=True, require_ready=False)
+        if self.retrying_home and value.get('home_skipped_active') is not False:
+            raise ValueError('HOME retry requires a new lower-switch contact')
         return True
 
     def begin_raise(self, height):
@@ -243,6 +286,48 @@ class LiftControl:
         self.set_commands += 1
         return False
 
+    def at_travel_height(self, height, home_generation):
+        value = self.status()
+        if (value['homed'] is not True or value['state'] != 'IDLE'
+                or value['home_completion_count'] != home_generation
+                or value['upper_active'] or value['lower_active']
+                or abs(value['position']-height) > .002
+                or abs(value['target']-height) > .002 or abs(value['velocity']) > .0005
+                or value.get('position_commands_ready') is not True):
+            raise ValueError('fresh lift feedback does not show the same raised, stationary forks')
+        return value
+
+    def begin_lower(self, height, home_generation):
+        self.at_travel_height(height, home_generation)
+        self.check_owners()
+        self.height = DELIVERY_HEIGHT_M
+        self.lower_started = time.monotonic()
+        self.stable_since = None
+
+    def lower_tick(self, original_height, home_generation):
+        value = self.status()
+        now = time.monotonic()
+        at_bottom = abs(value['position']-DELIVERY_HEIGHT_M) <= .001
+        if (not value['homed'] or value['home_completion_count'] != home_generation
+                or value['state'] not in ('IDLE', 'MOVING') or value['upper_active']
+                or value['position'] < DELIVERY_HEIGHT_M-.001
+                or value['position'] > original_height+.002 or value['velocity'] > .0005
+                or (value['lower_active'] and not at_bottom)):
+            raise ValueError('lift position, motion or limits became invalid during delivery')
+        accepted = abs(value['target']-DELIVERY_HEIGHT_M) <= .0001
+        if now-self.lower_started > 25. or (not accepted and now-self.lower_started > 2.):
+            raise ValueError('lift did not accept or reach the delivery height')
+        if accepted and at_bottom and value['state'] == 'IDLE' and abs(value['velocity']) <= .0005:
+            if self.stable_since is None:
+                self.stable_since = now
+            if now-self.stable_since >= .5:
+                return True
+        else:
+            self.stable_since = None
+        self.target_pub.publish(Float64MultiArray(data=[DELIVERY_HEIGHT_M]))
+        self.set_commands += 1
+        return False
+
     def stop(self):
         self.stop_pub.publish(Empty())
         self.stop_commands += 1
@@ -257,9 +342,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('home', 'stop'))
     parser.add_argument('--execute', action='store_true')
+    parser.add_argument('--telemetry', type=Path, help='Write HOME feedback to a JSON Lines file')
+    parser.add_argument('--retry-home', action='store_true', help='Retry V4 HOME once after raising clear of the bottom switch')
     args = parser.parse_args()
     if not args.execute:
         parser.error('--execute is required for a lift command')
+    if args.telemetry is not None and args.action != 'home':
+        parser.error('--telemetry is only supported with home')
+    if args.retry_home and args.action != 'home':
+        parser.error('--retry-home is only supported with home')
     rclpy.init()
     node = Node('r3_lift_home' if args.action == 'home' else 'r3_lift_stop')
     lift = LiftControl(node)
@@ -271,10 +362,17 @@ def main():
     started = time.monotonic()
     next_wait_report = started + 2.
     complete_since = None
+    trace = None
+    last_trace_sample = None
     try:
+        if args.telemetry is not None:
+            trace = args.telemetry.open('x', buffering=1, encoding='utf-8')
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=.05)
             now = time.monotonic()
+            if trace is not None and lift.value is not None and lift.sample_ms != last_trace_sample:
+                trace.write(json.dumps(lift.value, allow_nan=False)+'\n')
+                last_trace_sample = lift.sample_ms
             if args.action == 'stop':
                 if node.count_subscribers('/lift/stop'):
                     for _ in range(3):
@@ -287,7 +385,7 @@ def main():
             now_ros = node.get_clock().now().nanoseconds*1e-9
             if lift.requested_at is None:
                 try:
-                    lift.status()
+                    lift.home_preflight(retry_home=args.retry_home)
                     lift.check_owners()
                 except ValueError as exc:
                     if now-started > 10.:
@@ -304,8 +402,11 @@ def main():
                         raise ValueError('fresh stationary wheel encoder odom unavailable before HOME')
                     continue
                 base.arm()
-                print('Kiểm tra công tắc đáy: đã chạm thì HOME tại chỗ; chưa chạm mới tìm và hạ thêm 1 mm.', flush=True)
-                lift.home()
+                lift.home(retry_home=args.retry_home)
+                if lift.retrying_home:
+                    print('Đã gửi một lệnh thử lại HOME để tìm tiếp điểm đáy mới.', flush=True)
+                else:
+                    print('Kiểm tra công tắc đáy: đã chạm thì HOME tại chỗ; chưa chạm mới tìm và hạ thêm 1 mm.', flush=True)
             elif base.check(now, now_ros) and lift.home_complete():
                 if complete_since is None:
                     complete_since = now
@@ -313,7 +414,14 @@ def main():
                     print(json.dumps(dict(status='LIFT_HOME_READY', wheel_odom_max_gap_s=base.max_gap_s,
                                           **lift.report())), flush=True)
                     return
+    except (ValueError, OSError) as exc:
+        print(json.dumps(dict(status='LIFT_HOME_BLOCKED', reason=str(exc), telemetry=str(args.telemetry)
+                              if args.telemetry is not None else None, **lift.report()), ensure_ascii=False),
+              flush=True)
+        return 2
     finally:
+        if trace is not None:
+            trace.close()
         if args.action == 'home' and lift.requested_at is not None:
             for _ in range(3):
                 lift.stop()
@@ -323,4 +431,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

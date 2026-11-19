@@ -13,27 +13,33 @@ from types import SimpleNamespace
 # Use more of a real scan for continuous navigation readiness. This reduces
 # sampling jitter near the configured runtime/teaching fit thresholds.
 LIVE_SCAN_MAX_SAMPLES = 720
-RECOGNITION_MIN_INLIER_RATIO = .65
+NAVIGATION_MIN_INLIER_RATIO = .65
+NAVIGATION_MAX_MEDIAN_M = .12
+RECOGNITION_MIN_INLIER_RATIO = NAVIGATION_MIN_INLIER_RATIO
 RECOGNITION_MAX_MEDIAN_M = .05
 
 
-def validate_recognition_scan_match(fit):
-    """Runtime recognition fit: allow unmapped returns, retain close walls.
-
-    This is used together with fresh stationary evidence, diverse AMCL
-    particles and the independent <5 cm / 2 degree pose checks. Teaching a
-    new A retains its separate 80% requirement.
-    """
+def _validate_scan_match(fit, purpose, min_ratio, max_median):
     ratio=fit.get('inlier_ratio') if isinstance(fit,dict) else None
     median=fit.get('median_distance_m') if isinstance(fit,dict) else None
     finite=lambda value:isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value)
     if (not isinstance(fit,dict) or fit.get('ready') is not True
-            or not finite(ratio) or not RECOGNITION_MIN_INLIER_RATIO<=ratio<=1.
-            or not finite(median) or not 0.<=median<=RECOGNITION_MAX_MEDIAN_M+1e-9):
+            or not finite(ratio) or not min_ratio<=ratio<=1.
+            or not finite(median) or not 0.<=median<=max_median+1e-9):
         ratio_text=f'{ratio*100:.1f}%' if finite(ratio) else 'unavailable'
         median_text=f'{median*100:.2f} cm' if finite(median) else 'unavailable'
-        raise ValueError('recognition scan/map agreement requires >=65% inliers and median wall '
-                         f'distance <=5 cm (actual {ratio_text}, {median_text})')
+        raise ValueError(f'{purpose} scan/map agreement requires >={min_ratio*100:g}% inliers and median wall '
+                         f'distance <={max_median*100:g} cm (actual {ratio_text}, {median_text})')
+
+
+def validate_recognition_scan_match(fit):
+    """Require close wall agreement before pallet measurement at A."""
+    _validate_scan_match(fit, 'recognition', RECOGNITION_MIN_INLIER_RATIO, RECOGNITION_MAX_MEDIAN_M)
+
+
+def validate_navigation_scan_match(fit):
+    """Use the same wall-fit limits as the continuous localization monitor."""
+    _validate_scan_match(fit, 'navigation', NAVIGATION_MIN_INLIER_RATIO, NAVIGATION_MAX_MEDIAN_M)
 
 
 class ScanMapCheck:
@@ -130,7 +136,8 @@ class ScanMapCheck:
         return best if best<=self.max_distance_m else math.inf
 
     def score(self, scan, sensor_pose_map, *, max_samples=120, min_endpoints=30,
-              inlier_distance_m=.15, min_inlier_ratio=.65, max_median_distance_m=.12):
+              inlier_distance_m=.15, min_inlier_ratio=NAVIGATION_MIN_INLIER_RATIO,
+              max_median_distance_m=NAVIGATION_MAX_MEDIAN_M):
         if (len(sensor_pose_map) != 3
                 or not all(math.isfinite(v) for v in sensor_pose_map)
                 or not all(math.isfinite(v) for v in

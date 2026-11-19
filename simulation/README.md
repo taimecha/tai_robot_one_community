@@ -7,6 +7,7 @@ Tên thư mục được giữ để các lệnh đang dùng trên Pi tiếp t�
 | `run_r3_live_trial.sh` | Điều phối định vị, tới A, nhận diện và chạy tới C |
 | `run_r3_localization.sh`, `stop_r3_localization.sh`, `status_r3_localization.sh` | Mở, đóng và xem trạng thái định vị |
 | `save_r3_a.sh`, `r3_recognition_goal.py` | Lưu A khi được yêu cầu và điều hướng tới A |
+| `teach_r3_delivery.sh`, `r3_delivery_goal.py`, `status_r3_delivery.sh`, `save_r3_delivery.sh` | Nhận Nav2 Goal từ RViz hiện có; xác nhận tới/dừng, chỉ lưu điểm giao hàng sau lệnh xác nhận |
 | `r3_global_*`, `r3_amcl_*`, `r3_stationary_localization.py`, `r3_scan_map_check.py` | Khởi tạo và kiểm tra định vị LiDAR/bản đồ |
 | `r3_control_odom.py`, `r3_localization_contract.py` | Kết hợp odom/EKF với hiệu chỉnh định vị |
 | `r3_live_prepare.py`, `r3_approach_planner.py`, `r3_tracking.py`, `r3_core.py` | Khóa mục tiêu RGB-D, lập và kiểm tra quỹ đạo, bám đường |
@@ -44,5 +45,7 @@ python3 -m unittest discover -s simulation/tests -v
 ```
 
 Khóa phiên `.trial.lock` được giữ bởi shell điều phối; các tiến trình ROS, camera, Python và `tee` chạy lâu đóng descriptor khóa khi khởi động. `stop_r3_localization.sh` chờ shell dọn xong; nếu shell đã thoát mà tiến trình con còn thừa kế khóa từ phiên cũ, lệnh dừng xác minh inode/flock, danh tính và dự án trước khi đóng đúng tiến trình giữ khóa. Ctrl+C ngắt lệnh chờ với thông báo ngắn, không in traceback.
+
+Trong chế độ `--teach-delivery`, bộ giám sát giữ action `/navigate_to_pose` mà RViz đang dùng, kiểm tra định vị rồi chuyển tới action Nav2 riêng. Phản hồi, kết quả và yêu cầu hủy được chuyển tiếp. Không nhận goal thứ hai khi goal hiện tại chưa kết thúc. Mỗi goal mới hủy điều kiện lưu của goal trước. Bản tin tới đích chỉ cho phép lưu sau khi kiểm tra tư thế mới và dừng ổn định; dịch vụ lưu kiểm tra lại dữ liệu, phiên, bản đồ và dùng thao tác tạo tệp nguyên tử không ghi đè. Kiểm thử action dùng Nav2 giả trong DDS domain riêng, không phải thử xe thật.
 
 Lệnh đầy đủ và cấu hình RViz: [README dự án](../README.md). Dữ liệu đầu vào: [r3/README.md](r3/README.md).

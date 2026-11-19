@@ -16,3 +16,5 @@ compile_commands.json
 /simulation/output/
 # A is a machine/map-specific taught pose, saved explicitly on the real robot.
 /simulation/r3/recognition_A.json
+# Delivery is taught separately, only after an explicit save confirmation.
+/simulation/r3/delivery_goal.json

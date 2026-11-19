@@ -47,6 +47,7 @@ constexpr uint32_t LIFT_HOME_UPPER_RELEASE_TIMEOUT_MS = 750;
 constexpr long LIFT_HOME_SETTLE_STEPS = LIFT_STEPS_PER_M / 1000L;  // 1 mm
 constexpr uint32_t LIFT_HOME_SETTLE_TIMEOUT_MS = 1000;
 constexpr uint32_t LIFT_HOME_INPUT_CHECK_TIMEOUT_MS = 1000;
+constexpr uint32_t LIFT_HOME_CONTACT_TIMEOUT_MS = 1000;
 static_assert(LIFT_STEPS_PER_M % 1000L == 0, "1mm must map to whole steps");
 constexpr uint32_t LIFT_TELEMETRY_INTERVAL_MS = 100;
 
@@ -63,7 +64,7 @@ DebouncedLimit lowerLimit{LOWER_LIMIT_PIN, false, false, 0};
 DebouncedLimit upperLimit{UPPER_LIMIT_PIN, false, false, 0};
 
 enum class LiftMode : uint8_t { UNHOMED, IDLE, MOVING, HOMING, FAULT };
-enum class LiftHomeStage : uint8_t { NONE, CHECK_LOWER, SEEK_LOWER, HOME_SETTLE };
+enum class LiftHomeStage : uint8_t { NONE, CHECK_LOWER, SEEK_LOWER, CONFIRM_CONTACT, HOME_SETTLE };
 LiftHomeStage liftHomeStage = LiftHomeStage::NONE;
 long liftHomeStageStartSteps = 0;
 uint32_t liftHomeStageStartedMs = 0;
@@ -165,6 +166,18 @@ void setLiftFault(const char *fault) {
   Serial.printf("EVENT,LIFT_FAULT,%s\n", liftFault);
 }
 
+void setLiftContactFault(const char *fault, long travelled) {
+  setLiftFault(fault);
+  Serial.printf("EVENT,LIFT_HOME_DETAIL,%ld,%u,%u,%u,%u\n", travelled,
+    lowerLimit.rawActive ? 1U : 0U, lowerLimit.active ? 1U : 0U,
+    upperLimit.rawActive ? 1U : 0U, upperLimit.active ? 1U : 0U);
+}
+
+bool stableLowerContact(uint32_t nowMs) {
+  return lowerLimit.rawActive && lowerLimit.active &&
+    nowMs - lowerLimit.changedAtMs >= LIMIT_DEBOUNCE_MS;
+}
+
 void acceptLowerHome(bool alreadyActive = false) {
   liftStepper.setCurrentPosition(0);
   liftTargetSteps = 0;
@@ -226,7 +239,7 @@ void setLiftTarget(float targetMetres, uint32_t nowMs) {
 void handleSerialCommand(char *line, uint32_t nowMs) {
   (void)nowMs;
   if (strcmp(line, "LIFT,INFO") == 0) {
-    Serial.println("INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V3");
+    Serial.println("INFO,LIFT,HOME_SKIP_ACTIVE_1MM_NEW_CONTACT_V4");
     return;
   }
   if (strcmp(line, "LIFT,HOME") == 0) {
@@ -337,20 +350,41 @@ void updateLift(uint32_t nowMs) {
       liftHomeStage = LiftHomeStage::SEEK_LOWER;
       liftHomeStageStartedMs = nowMs;
     }
+    if (liftHomeStage == LiftHomeStage::CONFIRM_CONTACT) {
+      // The first raw edge stops the motor and fixes the travel reference.
+      // Wait in place through bounce; a new edge cannot extend the allowance.
+      if (upperLimit.active || upperLimit.rawActive) {
+        setLiftContactFault("HOME_SETTLE_HIT_UPPER", 0);
+      } else if (nowMs - liftHomeStageStartedMs > LIFT_HOME_CONTACT_TIMEOUT_MS) {
+        setLiftContactFault("HOME_CONTACT_UNCONFIRMED", 0);
+      } else if (stableLowerContact(nowMs)) {
+        liftHomeStage = LiftHomeStage::HOME_SETTLE;
+        liftHomeStageStartedMs = nowMs;
+        Serial.println("EVENT,LIFT_HOME_SETTLE_1MM");
+      }
+      return;
+    }
     if (liftHomeStage == LiftHomeStage::HOME_SETTLE) {
       const long travelled = liftHomeStageStartSteps-liftStepper.currentPosition();
       // Count from the first electrical contact, including any switch bounce.
       // Never restart or extend the 100-step allowance on another edge.
-      if (upperLimit.active || upperLimit.rawActive || travelled < 0 ||
-          travelled > LIFT_HOME_SETTLE_STEPS ||
-          nowMs-liftHomeStageStartedMs > LIFT_HOME_SETTLE_TIMEOUT_MS) {
-        setLiftFault("HOME_SETTLE_FAILED");
+      if (upperLimit.active || upperLimit.rawActive) {
+        setLiftContactFault("HOME_SETTLE_HIT_UPPER", travelled);
+        return;
+      }
+      if (travelled < 0 || travelled > LIFT_HOME_SETTLE_STEPS) {
+        setLiftContactFault("HOME_SETTLE_TRAVEL_INVALID", travelled);
+        return;
+      }
+      if (nowMs-liftHomeStageStartedMs > LIFT_HOME_SETTLE_TIMEOUT_MS) {
+        setLiftContactFault(travelled == LIFT_HOME_SETTLE_STEPS ?
+          "HOME_SETTLE_LOWER_UNSTABLE" : "HOME_SETTLE_STEP_TIMEOUT", travelled);
         return;
       }
       if (travelled == LIFT_HOME_SETTLE_STEPS) {
         liftStepper.setSpeed(0.);
         // Bounce may settle while stopped at exactly 1 mm; no extra steps.
-        if (lowerLimit.active && lowerLimit.rawActive) acceptLowerHome();
+        if (stableLowerContact(nowMs)) acceptLowerHome();
         return;
       }
       liftStepper.setSpeed(-metresToSteps(LIFT_HOME_SPEED_M_S));
@@ -381,10 +415,10 @@ void updateLift(uint32_t nowMs) {
     if (liftMode == LiftMode::HOMING && liftHomeStage == LiftHomeStage::SEEK_LOWER
         && lowerLimit.rawActive) {
       liftStepper.setSpeed(0.);
-      liftHomeStage = LiftHomeStage::HOME_SETTLE;
+      liftHomeStage = LiftHomeStage::CONFIRM_CONTACT;
       liftHomeStageStartSteps = liftStepper.currentPosition();
       liftHomeStageStartedMs = nowMs;
-      Serial.println("EVENT,LIFT_HOME_SETTLE_1MM");
+      Serial.println("EVENT,LIFT_HOME_CONTACT_CHECK");
       return;
     }
     if (liftMode == LiftMode::MOVING && liftTargetSteps < liftStepper.currentPosition()) {

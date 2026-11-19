@@ -35,20 +35,20 @@ from r3_core import FrozenPlan, errors, fork_for_base, wrap, compose
 from r3_real_obstacle_filter import read_real_target
 from r3_tracking import FixedPlanFollower, write_csv
 from r3_localization_contract import localization_spec, checked_status
-from r3_lift_control import LiftControl
+from r3_lift_control import HomeBaseGuard, LiftControl
 from r3_insertion_clearance import insertion_clearance
 
 LIDAR_TIMEOUT_S = 1.0
 LIDAR_START_FRESH_S = .30
 LIDAR_START_STABLE_S = .50
 ODOM_TIMEOUT_S = .20
-IMU_TIMEOUT_S = .20
-IMU_ODOM_MAX_DISAGREEMENT_DEG = 2.0
 YOLO_HEARTBEAT_TIMEOUT_S = .70
 SENSOR_HOLD_LATCH_S = 1.0
 C_RGBD_WAIT_LIMIT_S = 6.0
 CONTROL_PERIOD_S = .05
 INPUT_DRAIN_BUDGET_S = .015
+LIFT_WHEEL_ODOM_MAX_AGE_S = .5
+LIFT_GRAPH_CHECK_INTERVAL_S = .25
 
 
 class LocalizationPending(ValueError):
@@ -101,7 +101,7 @@ def configure_command_transport():
 
 def sensor_age(receive_age, capture_stamp, now_ros):
     """Include transport age, without extending freshness on message receipt."""
-    if capture_stamp is None:  # No accepted message yet; pose/IMU guards also apply.
+    if capture_stamp is None:  # No accepted message yet; the pose guard also applies.
         return receive_age
     capture_age = now_ros-capture_stamp
     return max(receive_age, capture_age) if capture_age >= -.05 else float('inf')
@@ -247,11 +247,6 @@ class OdomImuDiagnostics:
                     imu_calibration_status_available=False)
 
 
-def relative_imu_heading(odom_yaw_at_start, imu_yaw_at_start, imu_yaw_now):
-    """Keep the locked plan's odom heading origin while using IMU yaw change."""
-    return wrap(odom_yaw_at_start + wrap(imu_yaw_now-imu_yaw_at_start))
-
-
 def check_c_rgbd(samples, odom_gap_m, odom_yaw_error_rad, now):
     """Report fresh stationary RGB-D geometry and its disagreement with odom."""
     recent = [s for s in samples if now-s['received_wall'] <= 1.0]
@@ -296,6 +291,9 @@ class RealTrial(Node):
         self.lift = LiftControl(self) if pickup else None
         self.lift_history = []
         self.lift_base_pose = None
+        self.lift_wheels = HomeBaseGuard() if pickup else None
+        self.lift_next_graph_check = 0.
+        self.lift_lidar_source_warnings = 0
         self.insertion_report = None
         self.insertion_logged = False
         self.insertion_frame_lock = None
@@ -323,11 +321,6 @@ class RealTrial(Node):
         self.twist = None
         self.odom_wall = 0.
         self.odom_capture_stamp = None
-        self.imu_yaw = None
-        self.imu_yaw_rate = None
-        self.imu_wall = 0.
-        self.imu_capture_stamp = None
-        self.imu_anchor = None
         self.scan_wall = {'lidar': 0.}
         self.lidar_stable_since = 0.
         self.monitor_stop = False
@@ -385,7 +378,8 @@ class RealTrial(Node):
         self.subscribe_input(Odometry, '/base_controller/odom', self.on_wheel_odom, latest_sensor)
         self.subscribe_input(Float64MultiArray, '/wheel_pid_telemetry',
             lambda msg: self.diagnostics.on_wheel_pid(msg, time.monotonic()), latest_sensor)
-        self.subscribe_input(Imu, '/imu', self.on_imu, latest_sensor)
+        self.create_subscription(Imu, '/imu',
+            lambda msg: self.diagnostics.on_imu(msg, time.monotonic()), latest_sensor)
         self.subscribe_input(LaserScan, '/pallet/r3/filtered_lidar_scan',
                              lambda _: self.on_scan('lidar'), latest_sensor)
         self.subscribe_input(CollisionMonitorState, '/pallet/r3/collision_state',
@@ -418,7 +412,7 @@ class RealTrial(Node):
                     elif mode=='amcl_corrected_ekf':
                         self.get_logger().info('Đã nhận hiệu chỉnh AMCL hợp lệ; tiếp tục kết hợp với EKF.')
                     elif mode=='insertion_locked_ekf':
-                        self.get_logger().info('Đã giữ mốc chèn C→B; encoder/IMU giữ hướng thẳng, AMCL tiếp tục hiển thị trên RViz.')
+                        self.get_logger().info('Đã giữ mốc chèn C→B; odom giữ hướng thẳng, AMCL tiếp tục hiển thị trên RViz.')
         except LocalizationPending:
             # Preserve the real status and its original timestamp. The next
             # tick holds zero until both status and odometry are fresh again.
@@ -534,16 +528,19 @@ class RealTrial(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        twist = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
         norm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w
         if (msg.header.frame_id != 'odom'
                 or msg.child_frame_id not in ('base_footprint', 'base_link')
-                or not all(math.isfinite(v) for v in (p.x, p.y, norm))
+                or not all(math.isfinite(v) for v in (p.x, p.y, norm, *twist))
                 or abs(norm - 1.) > .02):
-            self.fail('invalid /odom frame, position or quaternion')
+            self.fail('invalid /odom frame, pose or velocity')
             return
         # A delayed sample cannot steer the robot. Leave the last valid pose
         # untouched so tick() commands zero until fresh odom arrives.
         if not -.05 <= now - stamp <= ODOM_TIMEOUT_S:
+            return
+        if self.odom_capture_stamp is not None and stamp <= self.odom_capture_stamp:
             return
         yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
         pose = (p.x, p.y, yaw)
@@ -553,37 +550,15 @@ class RealTrial(Node):
             return
         self.prev_pose, self.pose, self.odom_wall = pose, pose, time.monotonic()
         self.odom_capture_stamp = stamp
-        self.twist = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
+        self.twist = twist
 
     def on_wheel_odom(self, msg):
-        # Logging only. No raw wheel pose is substituted into the controller.
-        self.diagnostics.on_odom('wheel_odom', msg, time.monotonic())
-
-    def on_imu(self, msg):
-        self.diagnostics.on_imu(msg, time.monotonic())
-        now = self.get_clock().now().nanoseconds * 1e-9
-        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        q = msg.orientation
-        norm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w
-        if (msg.header.frame_id != 'imu_link' or msg.orientation_covariance[0] < 0
-                or not -.05 <= now-stamp <= IMU_TIMEOUT_S
-                or not math.isfinite(norm) or abs(norm-1.) > .02):
-            return
-        yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1-2*(q.y*q.y + q.z*q.z))
-        if self.imu_yaw is not None and abs(wrap(yaw-self.imu_yaw)) > math.radians(15):
-            self.fail('IMU heading jumped or reset')
-            return
-        self.imu_yaw, self.imu_wall = yaw, time.monotonic()
-        self.imu_capture_stamp = stamp
-        self.imu_yaw_rate = (msg.angular_velocity.z
-            if msg.angular_velocity_covariance[0] >= 0
-            and math.isfinite(msg.angular_velocity.z) else None)
-
-    def imu_control_pose(self):
-        if self.pose is None or self.imu_yaw is None or self.imu_anchor is None:
-            return None
-        return (self.pose[0], self.pose[1],
-                relative_imu_heading(self.imu_anchor[0], self.imu_anchor[1], self.imu_yaw))
+        # Encoder odom verifies that the base stays parked while lifting.
+        # The drive follower still uses the EKF/localized pose.
+        received = time.monotonic()
+        self.diagnostics.on_odom('wheel_odom', msg, received)
+        if self.lift_wheels is not None:
+            self.lift_wheels.update(msg, received, self.get_clock().now().nanoseconds*1e-9)
 
     def on_scan(self, name):
         now = time.monotonic()
@@ -593,14 +568,22 @@ class RealTrial(Node):
         self.scan_wall[name] = now
 
     def on_collision_state(self, msg):
+        if self.finished:
+            return
         if msg.action_type == CollisionMonitorState.DO_NOTHING:
-            if not self.started:
+            if not self.started or self.state == 'LIFTING':
                 self.monitor_stop = False
             return
         self.monitor_stop = True
-        # A transient missing source before the first movement holds zero;
-        # the monitor itself resumes when its scan is fresh again. A real
-        # obstacle, or any monitor stop after movement began, stays latched.
+        if msg.polygon_name == 'invalid source' and self.state == 'LIFTING':
+            # The drive remains stopped. A scan timestamp/TF diagnostic can
+            # inhibit the wheels without interrupting encoder-guarded lift motion.
+            self.lift_lidar_source_warnings += 1
+            if self.lift_lidar_source_warnings == 1:
+                self.get_logger().warn('LiDAR/TF tạm thiếu dữ liệu khi nâng tại B; giữ bánh đứng yên.')
+            return
+        # A real obstacle remains latched. The drive phase also latches loss
+        # of a collision source once it has moved from the start pose.
         if msg.polygon_name != 'invalid source' or self.started:
             self.fail('collision monitor stopped: ' + msg.polygon_name)
 
@@ -608,7 +591,7 @@ class RealTrial(Node):
         self.yolo_enabled = bool(msg.data)
         self.yolo_wall = time.monotonic()
         if self.yolo_enabled and self.started:
-            self.fail('YOLO was re-enabled during IMU/odom motion')
+            self.fail('YOLO was re-enabled during odom-controlled motion')
 
     def on_target(self, msg):
         if self.follow.state != 'WAIT_C_RGBD':
@@ -639,21 +622,18 @@ class RealTrial(Node):
         self.last_publish_duration_s = time.monotonic()-started
         self.last_command = (v, w)
 
-    def record_pose(self, control_pose, raw_imu_pose, diagnostic_imu_yaw,
-                    imu_odom_difference_deg, v=0., w=0.):
+    def record_pose(self, control_pose, v=0., w=0.):
         e = errors(control_pose, self.target, self.geometry)
         fork = fork_for_base(control_pose, self.geometry)
         self.rows.append(dict(wall_s=time.time(), state=self.state,
             x_m=control_pose[0], y_m=control_pose[1], yaw_rad=control_pose[2],
             raw_odom_x_m=self.pose[0], raw_odom_y_m=self.pose[1], raw_odom_yaw_rad=self.pose[2],
-            imu_control_yaw_rad=diagnostic_imu_yaw, raw_imu_yaw_rad=raw_imu_pose[2],
             control_yaw_rad=control_pose[2], heading_source=self.heading_source,
             insertion_heading_target_rad=self.follow.insertion_heading,
             insertion_heading_error_deg=(self.follow.insertion_heading_pid.report or {}).get('yaw_error_deg'),
             insertion_yaw_rate_rps=(self.follow.insertion_heading_pid.report or {}).get('yaw_rate_rps'),
             insertion_requested_omega_rps=(self.follow.insertion_heading_pid.report or {}).get('requested_omega_rps'),
             insertion_rate_integral_rps=self.follow.insertion_heading_pid.rate_integral,
-            imu_odom_disagreement_deg=imu_odom_difference_deg,
             fork_x_m=fork[0], fork_y_m=fork[1], fork_yaw_rad=fork[2],
             cmd_v_mps=v, cmd_w_rps=w, **e))
 
@@ -709,6 +689,32 @@ class RealTrial(Node):
                 self.diagnostics.rows[-1]['localized_odom_receive_age_s']=(
                     time.monotonic()-self.localized_wall if self.localized_wall else None)
 
+    def tick_parked_lift(self, wall, now_ros):
+        self.send()
+        wheels = self.lift_wheels
+        try:
+            if wheels.anchor is None or wheels.age(wall, now_ros) > LIFT_WHEEL_ODOM_MAX_AGE_S:
+                age = now_ros-wheels.stamp if wheels.stamp is not None else float('inf')
+                raise ValueError('fresh wheel encoder odom unavailable while lifting at B '
+                                 f'(source age {age:.3f}s, receive age {wall-wheels.received:.3f}s)')
+            displacement, turn = wheels.difference(wheels.pose, wheels.anchor)
+            if (displacement > .005 or turn > math.radians(.5)
+                    or abs(wheels.twist[0]) >= .005 or abs(wheels.twist[1]) >= .02):
+                raise ValueError('base moved while lifting at B')
+            if wall >= self.lift_next_graph_check:
+                if any(names != [owner] for _, _, owner, names in command_graph_status(self)):
+                    raise ValueError('wheel command ownership changed while lifting at B')
+                self.lift.check_owners()
+                self.lift_next_graph_check = wall+LIFT_GRAPH_CHECK_INTERVAL_S
+            done = self.lift.raise_tick()
+            self.lift_history.append(dict(wall_s=time.time(), **self.lift.report()))
+        except ValueError as exc:
+            self.fail(str(exc))
+            return
+        if done:
+            self.state, self.finished = 'PICKUP_COMPLETE', True
+            self.lift.stop()
+
     def control_tick(self):
         wall = time.monotonic()
         if not self.armed:
@@ -718,6 +724,9 @@ class RealTrial(Node):
             self.send()
             return
         now_ros = self.get_clock().now().nanoseconds*1e-9
+        if self.state == 'LIFTING':
+            self.tick_parked_lift(wall, now_ros)
+            return
         if self.monitor_stop and self.started:
             self.fail('obstacle stop')
             return
@@ -743,13 +752,10 @@ class RealTrial(Node):
         control_pose = self.localized_pose if self.localization else self.pose
         self.last_control_pose = control_pose
         odom_age = sensor_age(wall-self.odom_wall, self.odom_capture_stamp, now_ros)
-        imu_age = sensor_age(wall-self.imu_wall, self.imu_capture_stamp, now_ros)
         yolo_age = wall - self.yolo_wall
         lidar_age = wall - self.scan_wall['lidar']
         if self.pose is None or odom_age > ODOM_TIMEOUT_S:
             missing.append(f'odom={odom_age:.2f}s')
-        if self.imu_yaw is None or imu_age > IMU_TIMEOUT_S:
-            missing.append(f'IMU={imu_age:.2f}s')
         if self.yolo_enabled is not False or yolo_age > YOLO_HEARTBEAT_TIMEOUT_S:
             missing.append(f'YOLO-off={yolo_age:.2f}s, enabled={self.yolo_enabled}')
         if lidar_age > LIDAR_TIMEOUT_S:
@@ -774,8 +780,7 @@ class RealTrial(Node):
         if self.pickup:
             try:
                 self.lift.check_owners()
-                if self.state != 'LIFTING':
-                    self.lift.at_home()
+                self.lift.at_home()
             except ValueError as exc:
                 self.send()
                 if self.started or (self.armed_at is not None and wall-self.armed_at > 10.):
@@ -797,25 +802,14 @@ class RealTrial(Node):
                 self.fail('current odom does not match frozen start pose')
                 return
             self.started = True
-            self.imu_anchor = (self.pose[2], self.imu_yaw)
             self.follow.start(True)
             self.state = self.follow.state
             self.last_progress_pose, self.last_progress_wall = self.pose, wall
-        # The EKF /odom pose owns both XY and control yaw. Keep raw IMU
-        # relative heading as a diagnostic rather than replacing EKF yaw.
-        raw_imu_pose = self.imu_control_pose()
-        imu_odom_difference_deg = math.degrees(wrap(raw_imu_pose[2]-self.pose[2]))
         capture_correction = self.localization['correction_at_capture_xyyaw'] if self.localization else (0.,0.,0.)
         raw_reference_pose = compose(capture_correction, self.pose)
-        imu_reference_pose = compose(capture_correction, raw_imu_pose)
-        diagnostic_imu_yaw = imu_reference_pose[2]
-        if abs(imu_odom_difference_deg) > IMU_ODOM_MAX_DISAGREEMENT_DEG:
-            self.fail(f'IMU/odom heading disagreement {imu_odom_difference_deg:+.2f} deg')
-            return
         try:
             if not self.ensure_insertion_frame(control_pose, wall, now_ros):
-                self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw,
-                                 imu_odom_difference_deg)
+                self.record_pose(control_pose)
                 return
         except LocalizationPending as exc:
             self.hold_for_sensors([str(exc)], time.monotonic(), lidar_age)
@@ -823,29 +817,14 @@ class RealTrial(Node):
         except (ValueError, TypeError, KeyError) as exc:
             self.fail(str(exc))
             return
-        if self.pickup and self.state == 'LIFTING':
-            self.send()
-            if (not self.twist or abs(self.twist[0]) >= .005
-                    or abs(self.twist[1]) >= .02 or self.lift_base_pose is None
-                    or math.dist(self.pose[:2], self.lift_base_pose[:2]) > .005
-                    or abs(wrap(self.pose[2]-self.lift_base_pose[2])) > math.radians(.5)):
-                self.fail('base moved while lifting at B')
-                return
-            try:
-                done = self.lift.raise_tick()
-                self.lift_history.append(dict(wall_s=time.time(), **self.lift.report()))
-            except ValueError as exc:
-                self.fail(str(exc))
-                return
-            if done:
-                self.state, self.finished = 'PICKUP_COMPLETE', True
-                self.lift.stop()
-            return
         if self.braking_since is not None:
             self.send()
+            wheel_parked = (not self.pickup or (self.lift_wheels.ready(wall, now_ros)
+                and abs(self.lift_wheels.twist[0]) < .005 and abs(self.lift_wheels.twist[1]) < .02))
             if wall - self.braking_since >= .5:
                 e = errors(control_pose, self.target, self.geometry)
                 still = (self.twist and abs(self.twist[0]) < .005 and abs(self.twist[1]) < .005
+                         and wheel_parked
                          and (not self.localization or self.localization_status.get('correction_settled') is True))
                 if self.pickup and not still and wall-self.braking_since < 2.:
                     return
@@ -864,8 +843,7 @@ class RealTrial(Node):
                                   + self.insertion_report['reason'])
                     self.fail('after-braking odom goal criteria failed'+detail)
                     if self.pickup:
-                        self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw,
-                                         imu_odom_difference_deg)
+                        self.record_pose(control_pose)
                 else:
                     if self.pickup:
                         try:
@@ -875,10 +853,10 @@ class RealTrial(Node):
                             return
                         self.state = 'LIFTING'
                         self.lift_base_pose = tuple(self.pose)
+                        self.lift_wheels.arm()
                         # Include the actual settled B pose in the trajectory,
                         # rather than ending its CSV at the first brake command.
-                        self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw,
-                                         imu_odom_difference_deg)
+                        self.record_pose(control_pose)
                         self.get_logger().info('Đã dừng tại B; tự nâng càng lên 8 cm.')
                     else:
                         self.state, self.finished = 'DONE_TRACKING', True
@@ -900,11 +878,8 @@ class RealTrial(Node):
             if report_needed:
                 print(('KẾT QUẢ TẠI C: ' if self.arrive_at_c else 'KẾT QUẢ DỪNG TRƯỚC C: ') + json.dumps(dict(
                     control_yaw_error_deg=round(math.degrees(e['yaw_error_rad']), 2),
-                    imu_yaw_error_deg=round(math.degrees(
-                        errors(imu_reference_pose, self.target, self.geometry)['yaw_error_rad']), 2),
                     odom_yaw_error_deg=round(math.degrees(
                         errors(raw_reference_pose, self.target, self.geometry)['yaw_error_rad']), 2),
-                    imu_odom_disagreement_deg=round(imu_odom_difference_deg, 2),
                     estimated_lateral_cm=round(e['ey_m']*100, 2),
                     fork_tip_clearance_cm=round(clearance*100, 1),
                     stationary=bool(still)), ensure_ascii=False), flush=True)
@@ -938,7 +913,7 @@ class RealTrial(Node):
                     self.fail('odom alignment outside C diagnostic limits')
                 else:
                     self.state, self.finished = 'C_DIAGNOSTIC_DONE', True
-            self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw, imu_odom_difference_deg)
+            self.record_pose(control_pose)
             return
         if self.follow.state == 'WAIT_C_RGBD' and not camera_verified:
             if self.c_wait_started is None:
@@ -967,28 +942,34 @@ class RealTrial(Node):
             if not camera_verified and wall-self.c_wait_started > C_RGBD_WAIT_LIMIT_S:
                 self.fail('C RGB-D verification failed: ' + self.c_last_issue)
                 return
+        clearance_hold = self.follow.state == 'CLEARANCE_HOLD'
+        wheels_stopped = (clearance_hold and self.lift_wheels.ready(wall, now_ros)
+                          and abs(self.lift_wheels.twist[0]) < .005 and abs(self.lift_wheels.twist[1]) < .01)
         v, w = self.follow.step(control_pose, dt, obstacle=self.monitor_stop,
                                 c_verified=camera_verified,
                                 insertion_yaw=raw_reference_pose[2],
-                                insertion_yaw_rate=(self.imu_yaw_rate if self.imu_yaw_rate is not None
-                                    else self.twist[1] if self.twist else 0.),
+                                insertion_yaw_rate=self.twist[1],
                                 insertion_pose=raw_reference_pose,
-                                measured_speed=self.twist[0] if self.twist else None)
+                                measured_speed=self.twist[0], wheels_stopped=wheels_stopped)
         if self.follow.state == 'STOP_LATCHED':
             if self.pickup:
                 self.insertion_report = self.follow.insertion_report
             self.fail(self.follow.reason)
             if self.pickup:
-                self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw,
-                                 imu_odom_difference_deg)
+                self.record_pose(control_pose)
             return
+        if self.follow.state == 'CLEARANCE_HOLD' and not clearance_hold:
+            self.get_logger().warn('Tạm phanh ở C→B để kiểm tra lại khe hở càng sau khi bánh dừng.')
+        elif clearance_hold and self.follow.state == 'STRAIGHT':
+            self.get_logger().info('Đã xác nhận bánh đứng yên và khe hở đạt. Tiếp tục đến B từ vận tốc 0.')
+            self.last_progress_pose, self.last_progress_wall = control_pose, wall
         if self.pickup and self.follow.insertion_started and not self.insertion_logged:
             self.insertion_logged = True
-            self.get_logger().info('Tiếp tục C→B, bám góc 0° theo trục pallet bằng encoder/IMU gắn mốc A; '
+            self.get_logger().info('Tiếp tục C→B, bám góc 0° theo trục pallet bằng odom gắn mốc A; '
                 'khe hở ngang ước lượng tại C '
                 f'{self.follow.insertion_report["minimum_clearance_m"]*1000:.1f} mm '
                 '(đã kiểm tra cả hai càng trong quãng lệnh và phanh). '
-                f'Góc encoder/IMU tại C: {math.degrees(wrap(raw_reference_pose[2]-self.target[2])):+.2f}°.')
+                f'Góc odom tại C: {math.degrees(wrap(raw_reference_pose[2]-self.target[2])):+.2f}°.')
         if ((self.stop_at_c and self.follow.state == 'C_SETTLE')
                 or (self.arrive_at_c and self.follow.state == 'C_REACHED')):
             self.c_braking_since = wall
@@ -1009,7 +990,7 @@ class RealTrial(Node):
                 return
             self.state = self.follow.state
             self.send(v, w)
-        self.record_pose(control_pose, raw_imu_pose, diagnostic_imu_yaw, imu_odom_difference_deg, v, w)
+        self.record_pose(control_pose, v, w)
 
 
 def command_graph_status(probe):
@@ -1078,9 +1059,13 @@ def main():
                         help='Complete APPROACH to C and stop there; never enter C-to-B')
     parser.add_argument('--pickup', action='store_true',
                         help='Track continuously through C to B, stop wheels, then lift 0.08 m')
+    parser.add_argument('--deliver-after-pickup', action='store_true',
+                        help='Include the automatic delivery leg in the pickup confirmation')
     args = parser.parse_args()
     if sum((args.stop_at_c, args.arrive_at_c, args.pickup)) > 1:
         parser.error('choose only one of --stop-at-c, --arrive-at-c and --pickup')
+    if args.deliver_after_pickup and not args.pickup:
+        parser.error('--deliver-after-pickup requires --pickup')
     target, geometry = read_real_target(args.plan, args.allow_provisional)
     data = json.loads(args.plan.read_text())
     plan = FrozenPlan(**{key: data[key] for key in
@@ -1112,10 +1097,11 @@ def main():
         print('  Góc lắp camera so với càng chưa hiệu chuẩn; góc pallet vẫn là ước lượng.', flush=True)
     print(f'  Plan ID: {plan.plan_id}', flush=True)
     if target.get('localization'):
-        print('  Định vị điều khiển: AMCL LiDAR + bản đồ, kết hợp odom EKF encoder/IMU.', flush=True)
+        print('  Định vị: AMCL LiDAR + bản đồ. Bộ bám lấy hướng và tốc độ quay từ /odom (EKF).',
+              flush=True)
         print('  Bản đồ: ' + target['localization']['map_file'], flush=True)
     else:
-        print('  Điều khiển X/Y và góc: /odom (EKF encoder + IMU); IMU thô chỉ đối chiếu.', flush=True)
+        print('  Điều khiển X/Y, góc và tốc độ quay từ /odom (EKF).', flush=True)
     print(f"  Tốc độ tối đa: {geometry['max_speed']:.2f} m/s; giảm tốc theo độ cong và khoảng phanh.",
           flush=True)
     if phases[0].get('tracking_controller') == 'pose_feedback':
@@ -1129,7 +1115,7 @@ def main():
     elif args.arrive_at_c:
         print('ĐÍCH C: chạy hết A→C rồi dừng tại C; không đưa càng vào hoặc nâng pallet.', flush=True)
     elif args.stop_at_c:
-        print('CHẨN ĐOÁN: phanh trước C khoảng 5 cm, ghi góc IMU và odom cuối; '
+        print('CHẨN ĐOÁN: phanh trước C khoảng 5 cm, ghi góc odom cuối; '
               'không chạy C→B, không nâng pallet.', flush=True)
     if not args.execute:
         print(json.dumps({'status': 'READY_TO_CHECK_LIVE_SENSORS', 'plan_id': plan.plan_id,
@@ -1138,7 +1124,9 @@ def main():
     if not sys.stdin.isatty():
         parser.error('real execution requires an interactive terminal to review the printed measurement')
     try:
-        prompt = ('Kế hoạch đã khóa; Enter để chạy A→C→B và tự nâng 8 cm, Ctrl+C để hủy: '
+        prompt = ('Enter để lấy pallet, tự giao tới D và hạ càng, Ctrl+C để hủy: '
+                  if args.deliver_after_pickup else
+                  'Kế hoạch đã khóa; Enter để chạy A→C→B và tự nâng 8 cm, Ctrl+C để hủy: '
                   if args.pickup else
                   'Kế hoạch đã khóa; Enter để chạy A→C, Ctrl+C để hủy: '
                   if args.arrive_at_c else
@@ -1214,27 +1202,25 @@ def main():
                     math.degrees(wrap(node.rows[-1]['control_yaw_rad']-target['pose'][2]))
                     if node.rows else None),
                 'pallet_remeasured_at_stop': node.c_verified is not None,
-                'max_imu_odom_disagreement_deg': max(
-                    (abs(row['imu_odom_disagreement_deg']) for row in node.rows), default=None),
-                'final_imu_yaw_error_deg': (
-                    math.degrees(wrap(node.rows[-1]['imu_control_yaw_rad']-target['pose'][2]))
-                    if node.rows else None),
                 'c_rgbd_verification': node.c_verified,
                 'c_rgbd_measurement': node.c_rgbd_report,
                 'c_arrival': node.c_arrival_report,
                 'lift_commands': node.lift.set_commands if node.lift else 0,
                 'lift': node.lift.report() if node.lift else None,
                 'base_odom_at_raise_start': node.lift_base_pose,
+                'wheel_odom_at_raise_start': node.lift_wheels.anchor if node.lift_wheels else None,
+                'lift_lidar_source_warnings': node.lift_lidar_source_warnings,
                 'insertion_clearance': node.insertion_report or node.follow.insertion_report,
                 'insertion_frame_lock': node.insertion_frame_lock,
                 'insertion_camera_frame_clearance': node.follow.insertion_camera_frame_report,
+                'insertion_clearance_holds': node.follow.clearance_holds,
                 'insertion_heading_rad': node.follow.insertion_heading,
                 'longitudinal_control': dict(node.follow.speed_control.report or {},
                     braking_overspeed_reserve_m=node.follow.braking_overspeed_reserve_m),
                 'terminal_goal_check': node.follow.terminal_goal_report,
                 'insertion_heading_control': dict(
-                    feedback_source='camera_at_A_with_encoder_imu_yaw_change',
-                    rate_feedback_source=('imu_gyro' if node.imu_yaw_rate is not None else 'fused_odom'),
+                    feedback_source='camera_at_A_with_fused_odom_yaw_change',
+                    rate_feedback_source='fused_odom',
                     **(node.follow.insertion_heading_pid.report or {})) if node.pickup else None,
                 'sensor_holds': list(node.sensor_holds),
                 'control_stream_id': node.control_stream_id,

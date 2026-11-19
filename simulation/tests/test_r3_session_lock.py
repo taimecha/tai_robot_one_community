@@ -1,4 +1,4 @@
-"""Exercise real flock/fd inheritance with stub processes, never ROS/hardware."""
+"""Exercise the real R3 shell with stub processes, never ROS/hardware."""
 import json
 import os
 from pathlib import Path
@@ -146,6 +146,77 @@ exec 9>"$lock"
         (self.folder/'localization_session.json').write_text(json.dumps(dict(pid=2147483647)))
         self.assertIn('có thể chạy lượt mới', stop_session(self.root, timeout=.1))
         self.assertIn('có thể chạy lượt mới', stop_session(self.root, timeout=.1))
+
+
+class DeliveryStartupTests(unittest.TestCase):
+    def run_pickup_phase(self, outcome, *, shared=False):
+        # Run the real pickup-to-delivery shell flow without executing a ROS
+        # process. Record even a premature startup in the mock lift phase.
+        source = LAUNCHER.read_text()
+        _, tail = source.split('\ntrial_mode=(--arrive-at-c)\n', 1)
+        delivery = source.split('\ndeliver_pallet() {\n', 1)[1].split('\n}\n', 1)[0]
+        stub = '''set -euo pipefail
+run_dir=$1
+outcome=$2
+shared_navigation=$3
+events="$run_dir/events"
+plan=stub
+map_file=stub
+delivery_goal=stub
+pickup=1
+deliver_after_pickup=1
+safety_pid=safety
+control_odom_pid=control
+perception_pid=perception
+navigation_pid=nav2
+start_delivery_warmup() { echo premature_nav2 >>"$events"; }
+start_navigation() { echo "nav2:$1" >>"$events"; navigation_pid=nav2; }
+navigation_transition() { echo "same_nav2:$1" >>"$events"; }
+kill() { [[ $1 == -0 && $2 == nav2 ]]; }
+stop_owned() { echo "stop:$1" >>"$events"; }
+python3() {
+  case "$1" in
+    simulation/r3_real_trial.py)
+      echo lifting >>"$events"
+      mkdir -p "$run_dir/trial"
+      if [[ $outcome != CANCELLED ]]; then
+        printf '{"status":"%s"}\n' "$outcome" >"$run_dir/trial/mission_result.json"
+      fi
+      echo "trial_exit:$outcome" >>"$events"
+      ;;
+    simulation/r3_delivery_mission.py) echo "delivery:$2" >>"$events" ;;
+    -c) command python3 "$@" ;;
+    *) return 99 ;;
+  esac
+}
+trial_mode=(--arrive-at-c)
+'''
+        with tempfile.TemporaryDirectory(prefix='r3-delivery-phase-') as folder:
+            result = subprocess.run(['bash', '-c', 'deliver_pallet() {\n'+delivery+'\n}\n'+stub+tail,
+                                     'test', folder, outcome, str(int(shared))],
+                                    capture_output=True, text=True, timeout=5.)
+            return result, (Path(folder)/'events').read_text().splitlines()
+
+    def test_loaded_nav2_starts_after_successful_lift_and_pickup_cleanup(self):
+        result, events = self.run_pickup_phase('PICKUP_COMPLETE')
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual(events, ['lifting', 'trial_exit:PICKUP_COMPLETE',
+            'stop:safety', 'stop:control', 'stop:perception', 'nav2:true',
+            'delivery:navigate', 'stop:nav2', 'delivery:lower'])
+
+    def test_failed_or_cancelled_lift_does_not_start_delivery_nav2(self):
+        for outcome in ('STOP_LATCHED', 'CANCELLED'):
+            with self.subTest(outcome=outcome):
+                result, events = self.run_pickup_phase(outcome)
+                self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+                self.assertEqual(events, ['lifting', f'trial_exit:{outcome}'])
+
+    def test_lift_success_resumes_same_nav2_for_d(self):
+        result, events = self.run_pickup_phase('PICKUP_COMPLETE', shared=True)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual(events, ['lifting', 'trial_exit:PICKUP_COMPLETE',
+            'stop:safety', 'stop:control', 'stop:perception', 'same_nav2:resume',
+            'delivery:navigate', 'stop:nav2', 'delivery:lower'])
 
 
 if __name__ == '__main__':

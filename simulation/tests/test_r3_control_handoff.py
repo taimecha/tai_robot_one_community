@@ -7,7 +7,9 @@ import sys
 import tempfile
 import threading
 import time
+from types import MethodType, SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
@@ -16,10 +18,13 @@ try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
     from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import LaserScan
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
     from r3_control_odom import ControlOdomGuard, ControlOdomNode
     from r3_enable_trial import TrialEnableClient, enable_trial
+    from r3_recognition_goal import RecognitionGoal
+    from r3_stationary_localization import StationaryEvidence
 except ImportError as exc:
     raise unittest.SkipTest('ROS message/runtime dependencies unavailable: '+str(exc))
 
@@ -69,6 +74,74 @@ def odom_at(stamp, *, x_offset=0.):
     message.pose.pose.orientation.z = math.sin(yaw/2)
     message.pose.pose.orientation.w = math.cos(yaw/2)
     return message
+
+
+class StationaryReaderGapTests(unittest.TestCase):
+    def setUp(self):
+        self.pose = SOURCE['stationary_snapshot']['odom_anchor_xyyaw']
+        self.fit = SOURCE['scan_map_fit']
+        self.now = 100.
+        self.reader = SimpleNamespace(
+            continuous_localization=True, stationary_startup_pending=False,
+            stationary_mode=True, stationary_snapshot=SOURCE['stationary_snapshot'],
+            stationary_status=dict(run_id='run', ready=True, stationary_cache={'validated': True}),
+            stationary_evidence=StationaryEvidence(), stationary_validated_poses=[],
+            last_validated_scan=object(), stationary_fit_key=object(),
+            scan_stamp=None, stamp=RecognitionGoal.stamp, now=lambda: self.now,
+            stationary_since=time.monotonic()-2., particle_gate=SimpleNamespace(),
+            stationary_amcl=object(), _score_stationary_scan=Mock(return_value=self.pose))
+        for method in (RecognitionGoal._reset_a_scan_quality, RecognitionGoal._restart_local_scan_window):
+            setattr(self.reader, method.__name__, MethodType(method, self.reader))
+        self.reader.stationary_evidence.capture(97., self.pose)
+        for stamp in (98.8, 99.2, 99.6, 100.):
+            self.feed(stamp)
+
+    def feed(self, stamp, *, odom=True, scan=True, offset=0.):
+        self.now = stamp
+        if odom:
+            RecognitionGoal.on_odom(self.reader, odom_at(stamp, x_offset=offset))
+        if scan:
+            message = LaserScan()
+            message.header.frame_id = 'lidar_link'
+            message.header.stamp = odom_at(stamp).header.stamp
+            RecognitionGoal.on_scan(self.reader, message)
+            self.reader.stationary_evidence.observe_scan(stamp, self.fit, stamp,
+                                                        check_capture_continuity=False)
+
+    def current_pose(self):
+        return RecognitionGoal._current_stationary_pose(self.reader, self.now, True)
+
+    def test_forward_reader_gaps_require_a_new_window_on_same_observation(self):
+        self.assertEqual(self.current_pose(), self.pose)
+        self.feed(100.7)
+        self.assertIsNone(self.reader.stationary_evidence.fault)
+        self.assertIsNone(self.reader.last_validated_scan)
+        with self.assertRaisesRegex(ValueError, 'distinct matching scans'):
+            self.current_pose()
+        for stamp in (101., 101.3, 101.6, 101.8):
+            self.feed(stamp)
+        self.reader.stationary_status['stationary_cache']['validated'] = False
+        with self.assertRaisesRegex(ValueError, 'bridge is not validating'):
+            self.current_pose()
+        self.reader.stationary_status['stationary_cache']['validated'] = True
+        self.assertEqual(self.current_pose(), self.pose)
+        self.assertEqual(self.reader.stationary_evidence.observation_stamp, 97.)
+
+    def test_reader_gap_cannot_clear_displacement_or_reversed_lidar_clock(self):
+        self.feed(100.7, offset=.01)
+        self.assertIn('robot displacement', self.reader.stationary_evidence.fault)
+        self.feed(100.6, odom=False)
+        for stamp in (101., 101.3, 101.6, 101.9):
+            self.feed(stamp)
+        with self.assertRaisesRegex(ValueError, 'LiDAR timestamp moved backwards'):
+            self.current_pose()
+
+    def test_supervisor_still_invalidates_source_odom_gaps(self):
+        source = StationaryEvidence()
+        source.capture(97., self.pose)
+        source.update_odom(self.pose, (0., 0., 0.), 100., 100.)
+        source.update_odom(self.pose, (0., 0., 0.), 100.7, 100.7)
+        self.assertIn('odom gap', source.fault)
 
 
 class ControlEpochTests(unittest.TestCase):

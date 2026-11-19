@@ -171,6 +171,7 @@ class FixedPlanFollower:
     c_stop_trigger_m = .005
     c_command_latency_s = .20
     b_command_latency_s = .40
+    clearance_stationary_time_s = .25
 
     def __init__(self, phases, target, geometry, approach_only=False,
                  continuous_insertion=False):
@@ -184,6 +185,8 @@ class FixedPlanFollower:
         self.insertion_heading_lead_in_m = 0.
         self.insertion_report = None
         self.insertion_camera_frame_report = None
+        self.clearance_holds = []
+        self.clearance_stationary_s = 0.
         self.c_join_pose = None
         if continuous_insertion:
             if approach_only or [p['type'] for p in phases] != ['APPROACH', 'STRAIGHT']:
@@ -221,8 +224,57 @@ class FixedPlanFollower:
         self.v = self.w = self.reference_v = 0.
         self.speed_control.reset()
         self.insertion_heading_pid.reset_effort()
+        self.clearance_stationary_s = 0.
         if self.follower is not None:
             self.follower.v = 0.
+
+    def check_insertion_motion(self, pose, insertion_pose, speed, omega, latency, source):
+        frames = [('control', pose)]
+        if self.insertion_heading_active and insertion_pose is not None:
+            frames.append(('camera-at-A', insertion_pose))
+        blocked = None
+        for frame, frame_pose in frames:
+            report = insertion_motion_clearance(frame_pose, self.target, self.g,
+                speed, omega, latency_s=latency)
+            report['velocity_source'] = source
+            if frame == 'camera-at-A':
+                self.insertion_camera_frame_report = report
+            else:
+                self.insertion_report = report
+            if not report['ready']:
+                hit = report['first_intersection']
+                if hit['time_s'] == 0. or hit['obstacle'] != 'tine/pillar':
+                    return frame, report
+                if blocked is None:
+                    blocked = frame, report
+        return blocked
+
+    def clearance_hold_step(self, pose, insertion_pose, speed, omega, wheels_stopped, dt):
+        hold = self.clearance_holds[-1]
+        hold['duration_s'] += dt
+        blocked = self.check_insertion_motion(pose, insertion_pose, abs(speed or 0.), omega,
+                                             self.b_command_latency_s, 'measured_motion')
+        if blocked:
+            frame, report = blocked
+            hit = report['first_intersection']
+            if hit['time_s'] == 0. or hit['obstacle'] != 'tine/pillar':
+                self.state, self.reason = 'STOP_LATCHED', frame+' '+report['reason']
+                hold['outcome'] = 'unsafe_during_braking'
+                return 0., 0.
+        if (blocked is None and wheels_stopped and speed is not None
+                and abs(speed) < .005 and abs(omega) < .005):
+            self.clearance_stationary_s += dt
+            if self.clearance_stationary_s >= self.clearance_stationary_time_s:
+                self.state, self.reason = 'STRAIGHT', ''
+                hold.update(outcome='resumed', resumed_pose_xyyaw=list(pose))
+                return 0., 0.  # Check the first new command on the next tick.
+        else:
+            self.clearance_stationary_s = 0.
+        if hold['duration_s'] >= hold['wait_limit_s']:
+            self.state = 'STOP_LATCHED'
+            self.reason = 'could not confirm a safe stop after '+hold['reason']
+            hold['outcome'] = 'braking_timeout'
+        return 0., 0.
 
     def align(self, pose, goal_yaw, dt):
         if errors(pose, self.target, self.g)['gap_m'] <= self.g['fork_length']:
@@ -247,7 +299,7 @@ class FixedPlanFollower:
 
     def step(self, pose, dt=.05, obstacle=False, odom_valid=True, c_verified=True,
              insertion_yaw=None, insertion_yaw_rate=0., insertion_pose=None,
-             measured_speed=None):
+             measured_speed=None, wheels_stopped=False):
         if obstacle or not odom_valid:
             self.state = 'STOP_LATCHED'
             self.reason = 'obstacle stop' if obstacle else 'invalid odom'
@@ -256,6 +308,9 @@ class FixedPlanFollower:
         if measured_speed is not None and not math.isfinite(measured_speed):
             self.state, self.reason = 'STOP_LATCHED', 'invalid measured speed'
             return 0., 0.
+        if self.state == 'CLEARANCE_HOLD':
+            return self.clearance_hold_step(pose, insertion_pose, measured_speed,
+                                            insertion_yaw_rate, wheels_stopped, dt)
         if self.align_goal is not None:
             if abs(wrap(self.align_goal-pose[2])) < math.radians(self.alignment_done_deg):
                 self.w = 0.
@@ -477,7 +532,7 @@ class FixedPlanFollower:
         straight_hold = self.continuous_insertion and self.insertion_heading_active
         if straight_hold:
             # Geometry/collision checks retain the shared localized pose.
-            # Angular feedback uses encoder/IMU in the camera-at-A frame, so
+            # Angular feedback uses odometry in the camera-at-A frame, so
             # an AMCL yaw offset cannot masquerade as physical fork alignment.
             feedback_yaw = pose[2] if insertion_yaw is None else insertion_yaw
             try:
@@ -530,35 +585,36 @@ class FixedPlanFollower:
         self.w = w
         if self.continuous_insertion:
             latency = self.b_command_latency_s if self.insertion_started else self.c_command_latency_s
-            frames = [('control', pose)]
-            if straight_hold and insertion_pose is not None:
-                frames.append(('camera-at-A', insertion_pose))
-            for frame, frame_pose in frames:
-                # Check both the command still in the drive pipeline and the
-                # proposed correction. Include measured yaw rate during the
-                # heading handoff: the chassis may still be turning the other
-                # way. Never assume that a new PID output acted instantly.
-                commands = [('previous_command', previous_v, previous_w),
-                            ('next_command', v, w)]
-                if straight_hold or measured_speed is not None:
-                    commands.append(('measured_motion',
-                        max(previous_v, v, abs(measured_speed or 0.)), insertion_yaw_rate))
-                checked_commands = set()
-                for source, speed, omega in commands:
-                    if (speed, omega) in checked_commands:
-                        continue
-                    checked_commands.add((speed, omega))
-                    report = insertion_motion_clearance(frame_pose, self.target, self.g,
-                        speed, omega, latency_s=latency)
-                    report['velocity_source'] = source
-                    if frame == 'camera-at-A':
-                        self.insertion_camera_frame_report = report
-                    else:
-                        self.insertion_report = report
-                    if not report['ready']:
-                        self.state, self.reason = 'STOP_LATCHED', frame+' '+report['reason']
-                        self.v = self.w = self.follower.v = 0.
-                        return 0., 0.
+            # Check both frames for previous and proposed commands before
+            # treating a projected conflict in measured motion as recoverable.
+            commands = [('previous_command', previous_v, previous_w), ('next_command', v, w)]
+            if straight_hold or measured_speed is not None:
+                commands.append(('measured_motion', max(previous_v, v, abs(measured_speed or 0.)),
+                                 insertion_yaw_rate))
+            checked = set()
+            for source, speed, omega in commands:
+                if (speed, omega) in checked:
+                    continue
+                checked.add((speed, omega))
+                blocked = self.check_insertion_motion(pose, insertion_pose, speed, omega, latency, source)
+                if blocked is None:
+                    continue
+                frame, report = blocked
+                hit = report['first_intersection']
+                self.reason = frame+' '+report['reason']
+                last_resume = self.clearance_holds[-1].get('resumed_pose_xyyaw') if self.clearance_holds else None
+                if (self.insertion_started and source == 'measured_motion' and measured_speed is not None
+                        and hit['obstacle'] == 'tine/pillar' and hit['time_s'] > 0.
+                        and (last_resume is None or math.dist(pose[:2], last_resume[:2]) >= .005)):
+                    self.clearance_holds.append(dict(reason=self.reason, pose_xyyaw=list(pose),
+                        projected_intersection=hit, outcome='braking', duration_s=0.,
+                        wait_limit_s=latency+report['braking_time_s']+1.))
+                    self.state = 'CLEARANCE_HOLD'
+                    self.reset_motion()
+                else:
+                    self.state = 'STOP_LATCHED'
+                    self.v = self.w = self.follower.v = 0.
+                return 0., 0.
         return v, w
 
 

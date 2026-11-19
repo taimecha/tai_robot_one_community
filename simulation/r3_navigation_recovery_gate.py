@@ -24,12 +24,17 @@ RELEASE_MAX_AGE_S = .5
 
 
 class RecoveryInterlock:
-    def __init__(self):
+    def __init__(self, wait_for_delivery_handoff=False, shared_navigation=False):
+        self.wait_for_delivery_handoff = wait_for_delivery_handoff
+        self.shared_navigation = shared_navigation
+        self.pickup_seen = False
+        self.delivery_started = False
         self.identity = None
         self.last_status_stamp = None
-        self.hold = False
+        self.hold = wait_for_delivery_handoff or shared_navigation
         self.fault = None
-        self.reason = 'native navigation'
+        self.reason = ('waiting for delivery localization handoff' if wait_for_delivery_handoff
+                       else 'native navigation')
 
     def update(self, status, now):
         if not isinstance(status, dict):
@@ -42,15 +47,35 @@ class RecoveryInterlock:
         identity = (status.get('run_id'), status.get('map_file'))
         if not all(isinstance(value, str) and value for value in identity):
             return False
+        if self.wait_for_delivery_handoff and self.identity is None:
+            handoff = status.get('delivery_handoff')
+            if (not isinstance(handoff, dict) or status.get('navigation_monitor') is not True
+                    or (handoff.get('run_id'), handoff.get('map_file')) != identity
+                    or now-stamp > RELEASE_MAX_AGE_S):
+                return False
         if self.identity is None:
             self.identity = identity
         elif identity != self.identity:
             self.fault = 'localization session/map changed'
-        if status.get('navigation_monitor') is not True:
-            self.fault = 'localization role changed'
         if status.get('localization_fault'):
             self.fault = 'localization integrity fault: '+str(status['localization_fault'])
         self.last_status_stamp = stamp
+        if status.get('navigation_monitor') is not True:
+            trial = status.get('trial_handoff')
+            if (self.shared_navigation and not self.delivery_started
+                    and isinstance(trial, dict) and trial.get('enabled') is True):
+                self.pickup_seen = self.hold = True
+                self.reason = 'waiting for the pickup controller to release the base'
+                return True
+            self.fault = 'localization role changed'
+        if self.shared_navigation and (self.pickup_seen or status.get('trial_handoff') is not None):
+            handoff = status.get('delivery_handoff')
+            if (not isinstance(handoff, dict) or (handoff.get('run_id'), handoff.get('map_file')) != identity
+                    or now-stamp > RELEASE_MAX_AGE_S):
+                self.hold = True
+                self.reason = 'waiting for delivery localization handoff'
+                return True
+            self.delivery_started = True
         recovery = status.get('navigation_recovery')
         if not isinstance(recovery, dict) or type(recovery.get('hold_commands')) is not bool:
             return False
@@ -76,7 +101,9 @@ class RecoveryInterlock:
 class NavigationRecoveryGate(Node):
     def __init__(self):
         super().__init__('r3_navigation_recovery_gate')
-        self.interlock = RecoveryInterlock()
+        wait = self.declare_parameter('wait_for_delivery_handoff', False).value
+        shared = self.declare_parameter('shared_navigation', False).value
+        self.interlock = RecoveryInterlock(wait_for_delivery_handoff=wait, shared_navigation=shared)
         self.command = ZERO
         self.command_received_at = None
         self.last_reason = None

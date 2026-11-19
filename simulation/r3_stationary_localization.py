@@ -1,9 +1,9 @@
 """Validate a parked AMCL snapshot using live odom and distinct LiDAR scans.
 
-This does not publish/re-date AMCL, alter its covariance, or freeze a TF. Actual
-motion, gaps in sensor capture stamps and clock changes invalidate reuse until
-a new observation. Queued messages arriving late pause validation and clear the
-scan evidence window; they cannot themselves supply fresh confidence.
+Motion and clock changes invalidate reuse until a new observation. The sensor
+supervisor also invalidates capture gaps. A downstream reader can discard its
+local evidence window after missed messages while the supervisor validates the
+unchanged observation against the source streams.
 """
 from collections import deque
 import math
@@ -30,6 +30,10 @@ class StationaryEvidence:
         self.fault=str(reason)
         self.scans.clear()
 
+    def restart_scan_window(self,reason):
+        self.scans.clear()
+        self.reason=reason
+
     def capture(self,stamp,odom_pose,metrics=None):
         if not math.isfinite(stamp) or not _pose_ok(odom_pose):
             self.invalidate('invalid stationary AMCL snapshot');return False
@@ -53,19 +57,20 @@ class StationaryEvidence:
         if math.dist(self.odom_pose[:2],self.anchor[:2])>.005 or abs(angle)>math.radians(.5):
             self.invalidate('robot displacement invalidated stationary AMCL snapshot')
 
-    def update_odom(self,pose,twist,stamp,now):
+    def update_odom(self,pose,twist,stamp,now,*,check_capture_continuity=True):
         if (not _pose_ok(pose) or not _pose_ok(twist)
                 or not all(math.isfinite(v) for v in (stamp,now))
                 or now-stamp<-.05):
             self.invalidate('invalid/future odom for stationary AMCL snapshot');return
         if self.observation_stamp is not None and self.odom_stamp is not None:
-            if stamp<self.odom_stamp or stamp-self.odom_stamp>.5:
+            if stamp<self.odom_stamp or (check_capture_continuity and stamp-self.odom_stamp>.5):
                 self.invalidate('odom gap/clock change invalidated stationary AMCL snapshot')
+            elif stamp-self.odom_stamp>.5:
+                self.restart_scan_window('local odom delivery interrupted; collect fresh scan evidence')
         self.odom_stamp=stamp;self.odom_pose=tuple(pose);self.twist=tuple(twist)
         self._check_motion()
         if now-stamp>.25:
-            self.scans.clear()
-            self.reason='fresh odom unavailable; waiting for a new fresh scan evidence window'
+            self.restart_scan_window('fresh odom unavailable; waiting for a new fresh scan evidence window')
 
     def observe_scan(self,stamp,fit,now,*,check_capture_continuity=True):
         if not all(math.isfinite(v) for v in (stamp,now)) or now-stamp<-.05:
@@ -75,11 +80,7 @@ class StationaryEvidence:
                 if check_capture_continuity:
                     self.invalidate('LiDAR gap/clock change invalidated stationary AMCL snapshot')
                 else:
-                    # Continuous ROS readers validate every raw scan stamp
-                    # separately. Missing a transform/score is an evidence
-                    # gap, not proof that sensor captures stopped arriving.
-                    self.scans.clear()
-                    self.reason='scan validation interrupted; collect a new fresh evidence window'
+                    self.restart_scan_window('scan validation interrupted; collect a new fresh evidence window')
         previous=self.scan_stamp;self.scan_stamp=stamp
         if now-stamp>.5:
             self.scans.clear();self.reason='fresh LiDAR scan unavailable';return
@@ -103,6 +104,8 @@ class StationaryEvidence:
             return False,'stationary odom is missing/stale'
         if self.scan_stamp is None or not -.05<=now-self.scan_stamp<=.5:
             return False,'stationary LiDAR scan is missing/stale'
+        if not self.scans:
+            return False,self.reason
         if len(self.scans)<3 or self.scans[-1]-self.scans[0]<1.-1e-9:
             return False,'waiting for distinct matching scans spanning one second'
         return True,self.reason
