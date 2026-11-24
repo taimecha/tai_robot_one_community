@@ -394,9 +394,11 @@ private:
       params_->rotate_to_heading_min_angle));
     if (!turning_) {
       if (std::abs(angle) > threshold) {
+        const bool allow_long = (goal_rotation || std::hypot(end.position.x, end.position.y) > 0.50)
+          && std::abs(wrapAngle(angle)) >= 1.75;
         const auto chosen = chooseRotation(angle,
             [&](double sweep) {return sweepClear(pose, yaw, sweep);},
-          goal_rotation || std::hypot(end.position.x, end.position.y) > 0.50);
+          allow_long);
         if (!chosen) {
           rotation_blocked_ = true;
           throw nav2_core::NoValidControl("Both complete heading sweeps blocked; replan required");
@@ -433,7 +435,9 @@ private:
         return stop;
       }
       if (!sweepClear(pose, yaw, remaining_)) {
-        if (goal_rotation && !goal_sweep_flipped_) {
+        const bool allow_opposite = (goal_rotation || std::hypot(end.position.x, end.position.y) > 0.50)
+          && std::abs(wrapAngle(remaining_)) >= 1.75;
+        if (allow_opposite && !goal_sweep_flipped_) {
           const double opposite = remaining_ > 0.0 ? remaining_ - 2.0 * kPi : remaining_ + 2.0 * kPi;
           if (std::abs(opposite) <= StationaryTurnGuard::kMaxSweep && sweepClear(pose, yaw, opposite)) {
             goal_sweep_flipped_ = true;
@@ -441,7 +445,7 @@ private:
             terminal_braking_ = true;
             terminal_stop_ticks_ = 0;
             RCLCPP_WARN(logger_,
-              "Committed goal sweep blocked by updated costmap; braking to switch once to clear opposite sweep (%.1f deg)",
+              "Committed sweep blocked by updated costmap; braking to switch once to clear opposite sweep (%.1f deg)",
               opposite * 180.0 / kPi);
             geometry_msgs::msg::TwistStamped stop;
             stop.header = pose.header;
@@ -478,10 +482,13 @@ private:
           remaining_ * 180.0 / kPi, velocity.angular.z);
         return command;
       }
-      double angular_limit = terminal_turn ?
+      // Only taper down to the slow terminal angular cap in the final ~25 deg
+      // so large 90-180 deg pivots at A/D turn crisply without skid-steer stiction walk.
+      const bool fine_terminal_turn = terminal_turn && std::abs(remaining_) <= 0.45;
+      double angular_limit = fine_terminal_turn ?
         std::min(params_->rotate_to_heading_angular_vel, kTerminalAngularLimit) :
         params_->rotate_to_heading_angular_vel;
-      if (predictive_terminal_braking_ && terminal_turn) {
+      if (predictive_terminal_braking_ && fine_terminal_turn) {
         angular_limit = std::min(angular_limit, kMinimumLoadedAngularSpeed);
       }
       const double angular = boundedLoadedTurnCommand(remaining_, velocity.angular.z,

@@ -19,7 +19,10 @@ def obstacle_actions(context):
             name='spatial_depth_cloud', output='screen',
             parameters=[{
                 'pixel_stride': 4, 'max_rate_hz': 4.0,
-                'floor_reference': True, 'reference_u': 370.,
+                'floor_reference': True,
+                'fallback_to_static_slope': not floor_alignment,
+                'inverse_depth_x_slope': 0.00015807,
+                'reference_u': 370.,
                 'max_input_age_s': .5,
                 'output_topic': '/camera/depth/points_nav_corrected',
             }],

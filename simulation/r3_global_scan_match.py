@@ -16,7 +16,7 @@ def _wrap(angle):
 
 
 class GlobalScanMatcher:
-    def __init__(self, grid, min_inlier_ratio=.75):
+    def __init__(self, grid, min_inlier_ratio=.65):
         # Avoid library worker pools competing with sensor callbacks on Pi.
         cv2.setNumThreads(1)
         if not .5 <= min_inlier_ratio <= 1.:
@@ -204,11 +204,11 @@ class GlobalScanMatcher:
                       elapsed_s=time.monotonic()-started,
                       coarse_free_positions=len(positions), refined_seeds=len(seeds))
         def quality(metric):
-            return (metric[0] >= .65 and metric[1] >= self.min_inlier_ratio
-                    and metric[2] <= .05+1e-7 and metric[3] <= .10)
+            return (metric[0] >= .58 and metric[1] >= self.min_inlier_ratio
+                    and metric[2] <= .06+1e-7 and metric[3] <= .10)
         if not quality(train_score):
             report['reason'] = ('best global candidate fails scan/map quality '
-                                f'({self.min_inlier_ratio:.0%} inliers, median <=5 cm, score >=0.65, crossings <=10%)')
+                                f'({self.min_inlier_ratio:.0%} inliers, median <=6 cm, score >=0.58, crossings <=10%)')
         elif not quality(held_score):
             report['reason'] = 'held-out LiDAR beams reject the global candidate'
         elif margin < .10:

@@ -15,7 +15,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-def navigation_parameters(loaded_delivery=False):
+def navigation_parameters(loaded_delivery=False, camera_obstacles=False):
     root = Path(__file__).resolve().parents[3]
     params = yaml.safe_load((root/'ros2_ws/config/nav2_params.yaml').read_text())
 
@@ -48,7 +48,8 @@ def navigation_parameters(loaded_delivery=False):
     # approach and 0.20 rad/s cap were below the existing controller's loaded
     # translation/rotation floors and could produce ineffective commands.
     control['FollowPath'].update(desired_linear_vel=.18,min_approach_linear_velocity=.10,
-        regulated_linear_scaling_min_speed=.10,rotate_to_heading_angular_vel=.30,
+        regulated_linear_scaling_min_speed=.10,rotate_to_heading_angular_vel=.35,
+        rotate_to_heading_min_angle=.60,
         predictive_terminal_braking=True,terminal_command_latency=.25,
         terminal_angular_deceleration=1.5,allow_short_rear_goal_correction=True,
         allow_reverse_route_tracking=False,terminal_reverse_speed=.10,
@@ -66,7 +67,13 @@ def navigation_parameters(loaded_delivery=False):
         costmap=params[layer][layer]['ros__parameters']
         for optional in ('camera_obstacle_layer','fork_safety_layer','rear_safety_layer'):
             if optional in costmap:
-                costmap[optional]['enabled']=False
+                costmap[optional]['enabled']=bool(camera_obstacles) if optional=='camera_obstacle_layer' else False
+        if camera_obstacles and 'camera_obstacle_layer' in costmap:
+            cam_src = costmap['camera_obstacle_layer'].get('camera_obstacle_scan', {})
+            # Clear the 0.78 m loaded pallet nose so carried pallet cannot self-mark.
+            min_r = 0.85 if loaded_delivery else 0.60
+            cam_src['obstacle_min_range'] = min_r
+            cam_src['raytrace_min_range'] = min_r
         costmap.update(update_frequency=5.,publish_frequency=2.)
         if loaded_delivery:
             # Same chassis and front projection as at A. Widen the front
@@ -78,7 +85,7 @@ def navigation_parameters(loaded_delivery=False):
     # Nav2 cruise/turn speeds, but above the measured loaded speed floors.
     drive=yaml.safe_load((root/'ros2_ws/config/ros2_controllers_real.yaml').read_text())
     drive=drive['base_controller']['ros__parameters']
-    smoother.update(max_velocity=[.18,0.,.30],min_velocity=[-.10,0.,-.30],
+    smoother.update(max_velocity=[.18,0.,.35],min_velocity=[-.10,0.,-.35],
         max_accel=[.10,0.,.6],max_decel=[drive['linear.x.max_deceleration'],0.,
                                        drive['angular.z.max_deceleration']])
     behavior=params['behavior_server']['ros__parameters']
@@ -102,7 +109,8 @@ def navigation_actions(context):
     shared_navigation=LaunchConfiguration('shared_navigation').perform(context)=='true'
     loaded_delivery=shared_navigation or LaunchConfiguration('loaded_delivery').perform(context)=='true'
     private_navigation=loaded_delivery or LaunchConfiguration('delivery_teaching').perform(context)=='true'
-    params=navigation_parameters(loaded_delivery=loaded_delivery)
+    camera_obstacles=LaunchConfiguration('camera_obstacles').perform(context)=='true'
+    params=navigation_parameters(loaded_delivery=loaded_delivery, camera_obstacles=camera_obstacles)
     root = Path(__file__).resolve().parents[3]
     gate_args = []
     if loaded_delivery:
@@ -151,4 +159,5 @@ def generate_launch_description():
         DeclareLaunchArgument('delivery_teaching',default_value='false'),
         DeclareLaunchArgument('loaded_delivery',default_value='false'),
         DeclareLaunchArgument('shared_navigation',default_value='false'),
+        DeclareLaunchArgument('camera_obstacles',default_value='false'),
         OpaqueFunction(function=navigation_actions)])

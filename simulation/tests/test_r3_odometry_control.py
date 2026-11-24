@@ -14,7 +14,9 @@ try:
     from nav2_msgs.msg import CollisionMonitorState
     from std_msgs.msg import String
     from r3_lift_control import FIRMWARE_PROFILE, HOME_RETRY_FAULT, HomeBaseGuard, LiftControl
-    from r3_real_trial import RealTrial
+    from collections import deque
+    from r3_real_trial import (
+        OBSTACLE_CLEAR_SETTLE_S, OBSTACLE_HOLD_TIMEOUT_S, RealTrial)
 except ImportError as exc:
     raise unittest.SkipTest(str(exc))
 
@@ -27,12 +29,17 @@ def armed_pickup():
         localization=None, monitor_stop=False, pose=pose, twist=(.06, -.13),
         odom_wall=wall, odom_capture_stamp=99.98,
         yolo_enabled=False, yolo_wall=wall, scan_wall={'lidar': wall},
-        sensor_hold_since=None, lift=Mock(), braking_since=None,
+        lidar_stable_since=wall-1., last_control_pose=pose,
+        sensor_hold_since=None, lift=Mock(), braking_since=None, c_braking_since=None,
+        insertion_lock_wait_since=None,
+        obstacle_hold_since=None, obstacle_clear_since=None, obstacle_hold_polygon='',
+        obstacle_holds=deque(maxlen=64),
         stop_at_c=False, arrive_at_c=False, c_wait_started=None, c_verified=None,
         last_tick=wall-.05, last_progress_pose=pose, last_progress_wall=wall,
-        follow=SimpleNamespace(step=Mock(return_value=(.06, -.04)), state='APPROACH',
-                               insertion_started=False),
+        follow=SimpleNamespace(step=Mock(return_value=(.06, -.04)), reset_motion=Mock(),
+                               state='APPROACH', insertion_started=False),
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=100_000_000_000)),
+        get_logger=Mock(),
         ensure_insertion_frame=Mock(return_value=True), record_pose=Mock(),
         send=Mock(), fail=Mock(), hold_for_sensors=Mock(), diagnostics=Mock(),
     )
@@ -212,3 +219,88 @@ class HomeRetryTests(unittest.TestCase):
         self.feedback(state='IDLE', homed=True, lower_active=True, fault='NONE', home_completion_count=3,
                       home_skipped_active=True)
         self.assertTrue(self.lift.home_complete())
+
+
+class ObstacleHoldResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.node = armed_pickup()
+
+    def send_state(self, action_type, polygon_name=''):
+        msg = CollisionMonitorState(action_type=action_type, polygon_name=polygon_name)
+        RealTrial.on_collision_state(self.node, msg)
+
+    def test_stopzone_pauses_then_resumes_after_sustained_clear(self):
+        self.send_state(CollisionMonitorState.STOP, 'StopZone')
+        self.node.fail.assert_not_called()
+        self.node.send.assert_called_once_with()
+        self.assertIsNotNone(self.node.obstacle_hold_since)
+        self.assertEqual(len(self.node.obstacle_holds), 1)
+        self.assertFalse(self.node.obstacle_holds[0]['resumed'])
+
+        # While blocked, control_tick commands zero and does not call follower.step
+        self.node.send.reset_mock()
+        RealTrial.control_tick(self.node)
+        self.node.send.assert_called_once_with()
+        self.node.follow.step.assert_not_called()
+        self.assertEqual(self.node.state, 'OBSTACLE_HOLD')
+
+        # Brief DO_NOTHING flicker followed by STOP resets clear timer
+        self.send_state(CollisionMonitorState.DO_NOTHING)
+        self.assertIsNotNone(self.node.obstacle_clear_since)
+        self.send_state(CollisionMonitorState.STOP, 'StopZone')
+        self.assertIsNone(self.node.obstacle_clear_since)
+
+        # Sustained DO_NOTHING for < settle time still holds zero
+        self.send_state(CollisionMonitorState.DO_NOTHING)
+        self.node.obstacle_clear_since = time.monotonic() - (OBSTACLE_CLEAR_SETTLE_S * 0.5)
+        self.node.send.reset_mock()
+        RealTrial.control_tick(self.node)
+        self.node.follow.step.assert_not_called()
+        self.assertIsNotNone(self.node.obstacle_hold_since)
+
+        # Sustained DO_NOTHING >= settle time clears hold and resets follower motion
+        self.node.obstacle_hold_since = time.monotonic() - 5.0
+        self.node.obstacle_clear_since = time.monotonic() - (OBSTACLE_CLEAR_SETTLE_S + 0.05)
+        self.node.last_progress_wall = time.monotonic() - 5.0
+        RealTrial.control_tick(self.node)
+        self.assertFalse(self.node.monitor_stop)
+        self.assertIsNone(self.node.obstacle_hold_since)
+        self.assertEqual(self.node.state, 'APPROACH')
+        self.node.follow.reset_motion.assert_called_once()
+        self.assertTrue(self.node.obstacle_holds[0]['resumed'])
+        self.assertEqual(self.node.obstacle_holds[0]['outcome'], 'resumed')
+
+        # Next tick resumes normal motion cleanly without tripping progress watchdog
+        self.node.send.reset_mock()
+        RealTrial.control_tick(self.node)
+        self.node.fail.assert_not_called()
+        self.node.follow.step.assert_called_once()
+        self.node.send.assert_called_once_with(.06, -.04)
+
+    def test_stopzone_timeout_latches_stop(self):
+        self.send_state(CollisionMonitorState.STOP, 'StopZone')
+        self.node.obstacle_hold_since = time.monotonic() - (OBSTACLE_HOLD_TIMEOUT_S + 0.1)
+        RealTrial.control_tick(self.node)
+        self.node.fail.assert_called_once()
+        self.assertIn('StopZone', self.node.fail.call_args.args[0])
+        self.assertEqual(self.node.obstacle_holds[0]['outcome'], 'timeout')
+
+    def test_stopzone_during_braking_delays_lift_and_resets_braking_settle(self):
+        self.node.state = 'BRAKING'
+        self.node.braking_since = time.monotonic() - 0.6
+        self.send_state(CollisionMonitorState.STOP, 'StopZone')
+        RealTrial.control_tick(self.node)
+        self.node.lift.begin_raise.assert_not_called()
+        self.node.fail.assert_not_called()
+        self.send_state(CollisionMonitorState.DO_NOTHING)
+        self.node.obstacle_clear_since = time.monotonic() - (OBSTACLE_CLEAR_SETTLE_S + 0.05)
+        before = time.monotonic()
+        RealTrial.control_tick(self.node)
+        self.assertGreaterEqual(self.node.braking_since, before - 0.05)
+        self.node.lift.begin_raise.assert_not_called()
+
+    def test_sensor_loss_during_obstacle_hold_is_still_caught(self):
+        self.send_state(CollisionMonitorState.STOP, 'StopZone')
+        self.node.odom_capture_stamp = 99.5
+        RealTrial.control_tick(self.node)
+        self.node.hold_for_sensors.assert_called_once()

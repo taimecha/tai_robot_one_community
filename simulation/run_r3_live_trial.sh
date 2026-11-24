@@ -264,6 +264,7 @@ start_navigation() {
   local logfile="$out_dir/navigation.log"
   local archive="$out_dir/navigation_attempt"
   local navigation_options=()
+  [[ ${camera_obstacles:-0} -eq 0 ]] || navigation_options+=(camera_obstacles:=true)
   [[ $teach_delivery -eq 0 ]] || navigation_options+=(delivery_teaching:=true)
   if [[ $loaded == true ]]; then
     navigation_options+=(loaded_delivery:=true)
@@ -349,6 +350,56 @@ render_cycle_outputs() {
   fi
 }
 
+ensure_control_odom_healthy() {
+  local diag_dir=$1
+  local diag_file="$diag_dir/control_odom_status.jsonl"
+  local needs_restart=0
+  if [[ -z "${control_odom_pid:-}" ]] || ! kill -0 "$control_odom_pid" 2>/dev/null; then
+    needs_restart=1
+  elif [[ -s "$diag_file" ]]; then
+    if python3 9>&- - "$diag_file" << "PY"
+import json, sys
+lines = [l for l in open(sys.argv[1]) if l.strip()]
+if not lines:
+    sys.exit(1)
+last = json.loads(lines[-1])
+sys.exit(0 if last.get("integrity_fault") else 1)
+PY
+    then
+      needs_restart=1
+    fi
+  fi
+  if [[ $needs_restart -eq 1 ]]; then
+    echo "Odom điều khiển bị ngắt quãng lúc đứng yên tại A; khởi động lại r3_control_odom trước khi chạy A→C→B..."
+    stop_owned "${control_odom_pid:-}"
+    control_odom_pid=
+    : >"$diag_file"
+    setsid 9>&- python3 simulation/r3_control_odom.py --map "$map_file"       --diagnostics "$diag_file" >"$diag_dir/control_odom.log" 2>&1 &
+    control_odom_pid=$!
+    for _ in {1..50}; do
+      kill -0 "$control_odom_pid" 2>/dev/null || {
+        echo "Tiến trình odom điều khiển không khởi động lại được; xem $diag_dir/control_odom.log" >&2
+        return 2
+      }
+      if [[ -s "$diag_file" ]] && python3 9>&- - "$diag_file" << "PY"
+import json, sys
+lines = [l for l in open(sys.argv[1]) if l.strip()]
+if not lines:
+    sys.exit(1)
+last = json.loads(lines[-1])
+sys.exit(0 if (last.get("ready") is True and not last.get("integrity_fault")) else 1)
+PY
+      then
+        echo "Đã khôi phục r3_control_odom sạch trước khi xuất phát."
+        return 0
+      fi
+      sleep .1
+    done
+    echo "r3_control_odom chưa sẵn sàng sau khi khởi động lại; xem $diag_dir/control_odom.log" >&2
+    return 2
+  fi
+}
+
 run_repeat_cycle() {
   cycle_index=$((cycle_index + 1))
   cycle_dir="$run_dir/cycle_$(printf '%02d' "$cycle_index")"
@@ -357,17 +408,16 @@ run_repeat_cycle() {
   delivery_goal="$cycle_dir/delivery_goal.json"
   cp "$run_dir/delivery_goal.json" "$delivery_goal"
   cycle_rendered=0
+  cycle_end_wall=''
   echo ""
   echo "============================================================"
   echo "BẮT ĐẦU CHU TRÌNH #$cycle_index (giữ nguyên định vị AMCL ban đầu)"
   echo "Thư mục chu trình: $cycle_dir"
   echo "============================================================"
 
-  # Stop camera_obstacles during repeat cycle's return & YOLO phase if running.
-  if [[ -n "${camera_obstacles_pid:-}" ]]; then
-    stop_owned "$camera_obstacles_pid"
-    camera_obstacles_pid=''
-  fi
+  # Keep RGB-D camera_obstacles running continuously across cycles so Nav2
+  # costmaps and RViz always observe 3D obstacles without interruption.
+  start_camera_obstacles
 
   python3 9>&- simulation/r3_reset_cycle.py --timeout 20
 
@@ -454,16 +504,17 @@ run_repeat_cycle() {
     echo "Node đo pallet đã dừng; xem $cycle_dir/perception.log" >&2
     return 1
   }
+  python3 9>&- simulation/r3_perception_switch.py pause --wait-timeout 15
   setsid 9>&- ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$cycle_dir" \
     >"$cycle_dir/safety.log" 2>&1 &
   safety_pid=$!
-  python3 9>&- simulation/r3_perception_switch.py pause --wait-timeout 15
-  for _ in {1..25}; do
+  for _ in {1..50}; do
     grep -q 'Managed nodes are active' "$cycle_dir/safety.log" 2>/dev/null && break
     kill -0 "$safety_pid" 2>/dev/null || break
     sleep .1
   done
   kill -0 "$safety_pid" 2>/dev/null || { echo "Bộ dừng vật cản đã dừng; xem $cycle_dir/safety.log" >&2; return 1; }
+  ensure_control_odom_healthy "$cycle_dir"
 
   local rep_trial_mode=(--pickup --deliver-after-pickup --yes)
   set +e
@@ -717,11 +768,8 @@ if [[ $localization == amcl ]]; then
   fi
 fi
 
-# Nav2 to A uses LiDAR. Start the optional RGB-D processing after that leg
-# and HOME so its startup load does not compete with the odom/TF handoff.
-if [[ $nav_to_a -eq 0 && $recognize_here -eq 0 ]]; then
-  start_camera_obstacles
-fi
+# Keep RGB-D obstacle avoidance active continuously for Nav2 planning and RViz.
+start_camera_obstacles
 
 if [[ -n $resume_run ]]; then
   echo 'Tiếp tục chuyến giao hàng với pallet đã nâng. Đang kiểm tra xe và vị trí hiện tại.'
@@ -904,11 +952,6 @@ kill -0 "$perception_pid" 2>/dev/null || {
   echo 'Node đo pallet đã dừng trước khi tắt tracking; xem perception.log' >&2
   exit 1
 }
-if [[ $capture_only -eq 0 ]]; then
-  setsid 9>&- ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$run_dir" \
-    >"$run_dir/safety.log" 2>&1 &
-  safety_pid=$!
-fi
 python3 9>&- simulation/r3_perception_switch.py pause --wait-timeout 15
 echo 'Đã chốt vị trí pallet và tắt YOLO; dừng tracking pallet để giảm tải Pi.'
 echo "Ảnh kế hoạch hai tâm: $run_dir/plan/trajectory.svg"
@@ -922,12 +965,16 @@ if [[ $capture_only -eq 1 ]]; then
   exit 0
 fi
 
-for _ in {1..25}; do
+setsid 9>&- ros2 launch camera/detect_astra/launch/r3_safety.launch.py plan:="$plan" diagnostics_dir:="$run_dir" \
+  >"$run_dir/safety.log" 2>&1 &
+safety_pid=$!
+for _ in {1..50}; do
   grep -q 'Managed nodes are active' "$run_dir/safety.log" 2>/dev/null && break
   kill -0 "$safety_pid" 2>/dev/null || break
   sleep .1
 done
 kill -0 "$safety_pid" 2>/dev/null || { echo 'Bộ dừng vật cản đã dừng; xem safety.log' >&2; exit 1; }
+ensure_control_odom_healthy "$run_dir"
 
 trial_mode=(--arrive-at-c)
 [[ $pickup -eq 0 ]] || trial_mode=(--pickup)

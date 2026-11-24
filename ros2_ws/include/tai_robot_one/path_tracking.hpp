@@ -97,19 +97,27 @@ inline TrackingTarget trackingTarget(const std::vector<TrackingPose> & path)
       break;
     }
   }
-  // Near the route, follow its immediate travel tangent. Stop at an
-  // unfinished rotation primitive rather than looking through that turn.
+  // Near the route, follow the immediate ~0.25 m travel chord so initial
+  // heading alignment agrees with Pure Pursuit lookahead instead of fighting
+  // single 5 cm Smac2D grid steps. Stop early at an unfinished rotation cusp.
   if (path.size() > travel_start + 1 &&
     (travel_start > 0 || std::hypot(path.front().x, path.front().y) <= 0.25))
   {
+    const auto & origin = path[travel_start];
     for (size_t i = travel_start + 1; i < path.size(); ++i) {
-      const double dx = path[i].x - path[i - 1].x;
-      const double dy = path[i].y - path[i - 1].y;
-      if (std::hypot(dx, dy) >= 0.005) {
-        target.initial_angle = std::atan2(dy, dx);
+      const double step_d = std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+      if (step_d < 0.005 && std::abs(wrapAngle(path[i].yaw - path[i - 1].yaw)) > 0.02) {
         break;
       }
-      if (std::abs(wrapAngle(path[i].yaw - path[i - 1].yaw)) > 0.02) {break;}
+      const double chord_dx = path[i].x - origin.x;
+      const double chord_dy = path[i].y - origin.y;
+      const double chord_d = std::hypot(chord_dx, chord_dy);
+      if (chord_d >= 0.005) {
+        target.initial_angle = std::atan2(chord_dy, chord_dx);
+      }
+      if (chord_d >= 0.25) {
+        break;
+      }
     }
   }
   return target;

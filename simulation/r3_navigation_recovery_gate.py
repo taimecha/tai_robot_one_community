@@ -68,6 +68,13 @@ class RecoveryInterlock:
                 self.reason = 'waiting for the pickup controller to release the base'
                 return True
             self.fault = 'localization role changed'
+        if (self.shared_navigation and self.delivery_started
+                and status.get('navigation_monitor') is True
+                and status.get('trial_handoff') is None
+                and status.get('delivery_handoff') is None):
+            # Clean cycle reset after a completed delivery; allow the next A leg.
+            self.pickup_seen = False
+            self.delivery_started = False
         if self.shared_navigation and (self.pickup_seen or status.get('trial_handoff') is not None):
             handoff = status.get('delivery_handoff')
             if (not isinstance(handoff, dict) or (handoff.get('run_id'), handoff.get('map_file')) != identity

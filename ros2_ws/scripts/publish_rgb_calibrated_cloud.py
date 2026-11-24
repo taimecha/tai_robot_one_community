@@ -51,6 +51,7 @@ class CalibratedCloud(Node):
         self.declare_parameter("reference_u", 370.0)
         self.declare_parameter("output_topic", "/camera/depth/points_rgb_calibrated")
         self.declare_parameter("floor_reference", False)
+        self.declare_parameter("fallback_to_static_slope", False)
         self.declare_parameter("max_input_age_s", .5)
         self.declare_parameter("correction_status_topic", "/camera/depth/correction_status")
         self.stride = int(self.get_parameter("pixel_stride").value)
@@ -59,6 +60,8 @@ class CalibratedCloud(Node):
         self.reference_u = float(self.get_parameter("reference_u").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
         self.floor_reference = bool(self.get_parameter("floor_reference").value)
+        self.fallback_to_static_slope = bool(self.get_parameter("fallback_to_static_slope").value)
+        self.last_valid_slope = self.inverse_depth_x_slope
         self.max_input_age_s = float(self.get_parameter("max_input_age_s").value)
         if self.stride < 1 or self.max_rate_hz <= 0 or not np.isfinite(self.max_input_age_s) or self.max_input_age_s <= 0:
             raise ValueError("pixel_stride and max_rate_hz must be positive")
@@ -146,16 +149,22 @@ class CalibratedCloud(Node):
             depth = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, row_width)[:, : msg.width]
             depth_mm = depth if scale == .001 else depth.astype(np.float64) * 1000.
             slope = self.inverse_depth_x_slope
+            reason = "current capture corrected with shared pallet geometry"
             if self.floor_reference:
-                # This is the same deterministic fit and the same full frame
-                # used by --heading-floor-reference pallet recognition. It
-                # needs no YOLO node and never reuses an old fit after failure.
-                slope, diagnostics = floor_depth_skew(depth_mm, self.intrinsics)
-                status.update(diagnostics)
+                try:
+                    slope, diagnostics = floor_depth_skew(depth_mm, self.intrinsics)
+                    self.last_valid_slope = slope
+                    status.update(diagnostics)
+                except ValueError as floor_exc:
+                    if not self.fallback_to_static_slope:
+                        raise
+                    slope = self.last_valid_slope
+                    status["source"] = "floor_skew_fallback_last_valid"
+                    status["floor_fit_issue"] = str(floor_exc)
+                    reason = "floor obscured; continuing RGB-D obstacle cloud with last valid slope"
             xyz = project_corrected_depth(depth_mm[::self.stride, ::self.stride],
                 self.rays, self.u_coords, slope, self.reference_u)
-            status.update(ready=True, inverse_depth_x_slope=slope,
-                          reason="current capture corrected with shared pallet geometry")
+            status.update(ready=True, inverse_depth_x_slope=slope, reason=reason)
         except (ValueError, TypeError) as exc:
             status['reason'] = str(exc)
             self.publish_status(status)

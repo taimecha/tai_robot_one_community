@@ -194,8 +194,16 @@ def build_plan(snapshot, start, geometry, output):
     # Keep the longest feasible lead, with the previously supported 12 cm as
     # the lower bound. Every candidate still passes the complete fork sweep
     # and predicted-follower checks; C->B stays the same zero-heading line.
-    lead_candidates = (.25, .20, .15, .12)
-    for straight_lead_in_m, extra in ((lead, extra) for lead in lead_candidates
+    # Prefer the gentlest 0.60 m turning radius and longest straight lead-in first.
+    # For off-center pallets (e.g. 15-20 cm lateral offset without moving the pallet),
+    # allow progressively tighter radii down to 0.35 m and 8 cm lead-in while still
+    # enforcing full fork-sweep collision validation and predicted-follower checks.
+    radius_candidates = (.60, .50, .45, .40, .35)
+    lead_candidates = (.25, .20, .15, .12, .08)
+    for radius_bound, straight_lead_in_m, extra in (
+            (radius, lead, extra)
+            for radius in radius_candidates
+            for lead in lead_candidates
             for extra in (R3_PLANNED_C_CLEARANCE_M, .20, .25, .30)):
         gap = geometry['fork_length'] + extra
         c = goal_base(target, geometry, gap)
@@ -203,8 +211,8 @@ def build_plan(snapshot, start, geometry, output):
         b = goal_base(target, geometry)
         try:
             curve, curvature, overshoot, shape = minimum_jerk_approach(
-                start, curve_end, target, geometry, radius_bound=.6,
-                curvature_cap=1/.6)
+                start, curve_end, target, geometry, radius_bound=radius_bound,
+                curvature_cap=1/radius_bound)
             approach = [*curve, *list(dense([curve_end, c], step=.01))[1:]]
             phases = [dict(type='APPROACH', poses=approach,
                            straight_lead_in_m=straight_lead_in_m,
@@ -222,6 +230,7 @@ def build_plan(snapshot, start, geometry, output):
                               straight_lead_in_m=straight_lead_in_m,
                               preferred_straight_lead_in_m=lead_candidates[0],
                               minimum_straight_lead_in_m=lead_candidates[-1],
+                              radius_bound_m=radius_bound,
                               max_curvature_1pm=curvature, fork_overshoot_m=overshoot,
                               shape_coefficients=shape),
                           tracking_controller='curvature feedforward + odom heading and lateral feedback',

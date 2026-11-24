@@ -44,6 +44,8 @@ LIDAR_START_STABLE_S = .50
 ODOM_TIMEOUT_S = .20
 YOLO_HEARTBEAT_TIMEOUT_S = .70
 SENSOR_HOLD_LATCH_S = 1.0
+OBSTACLE_CLEAR_SETTLE_S = 1.0
+OBSTACLE_HOLD_TIMEOUT_S = 30.0
 C_RGBD_WAIT_LIMIT_S = 6.0
 CONTROL_PERIOD_S = .05
 INPUT_DRAIN_BUDGET_S = .015
@@ -343,6 +345,10 @@ class RealTrial(Node):
         self.sensor_hold_since = None
         self.sensor_hold_reason = ''
         self.sensor_holds = deque(maxlen=64)
+        self.obstacle_hold_since = None
+        self.obstacle_clear_since = None
+        self.obstacle_hold_polygon = ''
+        self.obstacle_holds = deque(maxlen=64)
         self.c_rgbd_samples = deque(maxlen=20)
         self.c_wait_started = None
         self.c_verified = None
@@ -570,11 +576,16 @@ class RealTrial(Node):
     def on_collision_state(self, msg):
         if self.finished:
             return
+        wall = time.monotonic()
         if msg.action_type == CollisionMonitorState.DO_NOTHING:
-            if not self.started or self.state == 'LIFTING':
+            if self.obstacle_hold_since is not None:
+                if self.obstacle_clear_since is None:
+                    self.obstacle_clear_since = wall
+            elif not self.started or self.state == 'LIFTING':
                 self.monitor_stop = False
             return
         self.monitor_stop = True
+        self.obstacle_clear_since = None
         if msg.polygon_name == 'invalid source' and self.state == 'LIFTING':
             # The drive remains stopped. A scan timestamp/TF diagnostic can
             # inhibit the wheels without interrupting encoder-guarded lift motion.
@@ -582,8 +593,30 @@ class RealTrial(Node):
             if self.lift_lidar_source_warnings == 1:
                 self.get_logger().warn('LiDAR/TF tạm thiếu dữ liệu khi nâng tại B; giữ bánh đứng yên.')
             return
-        # A real obstacle remains latched. The drive phase also latches loss
-        # of a collision source once it has moved from the start pose.
+        if msg.polygon_name == 'StopZone' and self.state != 'LIFTING':
+            # Dynamic obstacle in StopZone during approach/insertion: hold zero
+            # velocity and wait for the path to clear continuously before
+            # ramping back up from zero.
+            self.send()
+            if self.obstacle_hold_since is None:
+                self.obstacle_hold_since = wall
+                self.obstacle_hold_polygon = msg.polygon_name
+                if self.started:
+                    pose = self.last_control_pose or self.pose
+                    self.obstacle_holds.append(dict(
+                        started_monotonic_s=wall,
+                        polygon=msg.polygon_name,
+                        state=self.state,
+                        pose_xyyaw=list(pose) if pose is not None else None,
+                        resumed=False))
+                    self.get_logger().warn(
+                        'Phát hiện vật cản trong StopZone; tạm dừng xe (v=0) chờ vật cản đi ra...')
+                else:
+                    self.get_logger().warn(
+                        'Có vật cản trong StopZone trước khi xuất phát; tạm chờ đường trống...')
+            return
+        # StopZone during LIFTING, unknown polygons, or loss of a collision
+        # source during drive remain latched.
         if msg.polygon_name != 'invalid source' or self.started:
             self.fail('collision monitor stopped: ' + msg.polygon_name)
 
@@ -680,6 +713,11 @@ class RealTrial(Node):
                     active=self.sensor_hold_since is not None, reason=self.sensor_hold_reason,
                     duration_s=(time.monotonic()-self.sensor_hold_since
                                 if self.sensor_hold_since is not None else 0.))
+                self.diagnostics.rows[-1]['obstacle_hold'] = dict(
+                    active=self.obstacle_hold_since is not None, polygon=self.obstacle_hold_polygon,
+                    clearing=self.obstacle_clear_since is not None,
+                    duration_s=(time.monotonic()-self.obstacle_hold_since
+                                if self.obstacle_hold_since is not None else 0.))
                 self.diagnostics.rows[-1]['longitudinal_control'] = dict(
                     self.follow.speed_control.report or {},
                     braking_overspeed_reserve_m=self.follow.braking_overspeed_reserve_m)
@@ -727,7 +765,7 @@ class RealTrial(Node):
         if self.state == 'LIFTING':
             self.tick_parked_lift(wall, now_ros)
             return
-        if self.monitor_stop and self.started:
+        if self.monitor_stop and self.started and self.obstacle_hold_since is None:
             self.fail('obstacle stop')
             return
         missing = []
@@ -786,6 +824,48 @@ class RealTrial(Node):
                 if self.started or (self.armed_at is not None and wall-self.armed_at > 10.):
                     self.fail(str(exc))
                 return
+        if self.obstacle_hold_since is not None:
+            self.send()
+            if self.started:
+                self.state = 'OBSTACLE_HOLD'
+                self.record_pose(control_pose)
+            hold_duration = wall - self.obstacle_hold_since
+            if hold_duration >= OBSTACLE_HOLD_TIMEOUT_S:
+                if self.obstacle_holds and not self.obstacle_holds[-1].get('resumed'):
+                    self.obstacle_holds[-1].update(
+                        resumed=False, duration_s=hold_duration, outcome='timeout')
+                self.fail(f'obstacle remained in {self.obstacle_hold_polygon} for '
+                          f'{hold_duration:.1f}s (limit {OBSTACLE_HOLD_TIMEOUT_S:.0f}s)')
+                return
+            if (self.obstacle_clear_since is not None
+                    and wall - self.obstacle_clear_since >= OBSTACLE_CLEAR_SETTLE_S
+                    and lidar_age <= LIDAR_START_FRESH_S
+                    and wall - self.lidar_stable_since >= LIDAR_START_STABLE_S):
+                self.monitor_stop = False
+                self.obstacle_hold_since = None
+                self.obstacle_clear_since = None
+                self.obstacle_hold_polygon = ''
+                self.follow.reset_motion()
+                self.last_tick = self.last_progress_wall = wall
+                self.last_progress_pose = control_pose
+                if self.braking_since is not None:
+                    self.braking_since = wall
+                if getattr(self, 'c_braking_since', None) is not None:
+                    self.c_braking_since = wall
+                if getattr(self, 'insertion_lock_wait_since', None) is not None:
+                    self.insertion_lock_wait_since = None
+                if self.started:
+                    if self.obstacle_holds and not self.obstacle_holds[-1].get('resumed'):
+                        self.obstacle_holds[-1].update(
+                            resumed=True, duration_s=hold_duration, outcome='resumed')
+                    self.state = self.follow.state
+                    self.get_logger().info(
+                        f'Vật cản đã rời khỏi StopZone (đã chờ {hold_duration:.1f}s); '
+                        'tiếp tục hành trình A→C→B từ vận tốc 0.')
+                else:
+                    self.get_logger().info(
+                        f'StopZone đã trống (đã chờ {hold_duration:.1f}s); sẵn sàng xuất phát.')
+            return
         if not self.started:
             if self.localization and self.localization_status.get('correction_settled') is not True:
                 self.send()
@@ -1228,6 +1308,7 @@ def main():
                     rate_feedback_source='fused_odom',
                     **(node.follow.insertion_heading_pid.report or {})) if node.pickup else None,
                 'sensor_holds': list(node.sensor_holds),
+                'obstacle_holds': list(node.obstacle_holds),
                 'control_stream_id': node.control_stream_id,
                 'command_publication_mode': os.environ.get('RMW_FASTRTPS_PUBLICATION_MODE'),
                 'command_lifespan_s': ODOM_TIMEOUT_S,

@@ -126,5 +126,32 @@ class TrajectoryVizTests(unittest.TestCase):
         self.assertTrue(bridge.correction.measurement_ok)
 
 
+
+    def test_recovery_interlock_unlocks_on_repeat_cycle_after_delivery(self):
+        from r3_navigation_recovery_gate import RecoveryInterlock
+        gate = RecoveryInterlock(wait_for_delivery_handoff=False, shared_navigation=True)
+        base = {'run_id': 'r1', 'map_file': '/m.yaml', 'navigation_monitor': True,
+                'navigation_recovery': {'hold_commands': False}}
+        # Cycle 1 A leg: unlocked
+        self.assertTrue(gate.update({**base, 'published_ros_s': 10.0}, 10.1))
+        self.assertFalse(gate.hold)
+        # Cycle 1 pickup: locked
+        self.assertTrue(gate.update({**base, 'published_ros_s': 11.0, 'navigation_monitor': False,
+                                     'trial_handoff': {'enabled': True}}, 11.1))
+        self.assertTrue(gate.hold)
+        # Before delivery handoff: still locked
+        self.assertTrue(gate.update({**base, 'published_ros_s': 12.0, 'trial_handoff': {'enabled': True}}, 12.1))
+        self.assertTrue(gate.hold)
+        # Cycle 1 delivery handoff: unlocked
+        self.assertTrue(gate.update({**base, 'published_ros_s': 13.0, 'trial_handoff': {'enabled': True},
+                                     'delivery_handoff': {'run_id': 'r1', 'map_file': '/m.yaml'}}, 13.1))
+        self.assertFalse(gate.hold)
+        # Cycle 2 after reset_cycle (trial_handoff=None, delivery_handoff=None): unlocked!
+        self.assertTrue(gate.update({**base, 'published_ros_s': 14.0, 'trial_handoff': None,
+                                     'delivery_handoff': None}, 14.1))
+        self.assertFalse(gate.hold)
+        self.assertEqual(gate.reason, 'native navigation')
+
+
 if __name__ == '__main__':
     unittest.main()

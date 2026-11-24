@@ -1,8 +1,8 @@
 <!-- Keep a valid route; prefer the checked straight-route Smac2D wrapper,
-     with safe non-moving wait + costmap-clear retries for dynamic obstacles. -->
+     with safe non-moving wait + costmap-clear + settle retries for dynamic obstacles. -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="8" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="20" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridShortest" topic_name="planner_selector"/>
@@ -23,9 +23,10 @@
         <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
       </PipelineSequence>
       <Sequence name="DynamicObstacleWaitRecovery">
+        <Wait wait_duration="1.5"/>
         <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
         <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
-        <Wait wait_duration="2.0"/>
+        <Wait wait_duration="0.5"/>
       </Sequence>
     </RecoveryNode>
   </BehaviorTree>
