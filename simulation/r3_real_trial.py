@@ -1061,6 +1061,8 @@ def main():
                         help='Track continuously through C to B, stop wheels, then lift 0.08 m')
     parser.add_argument('--deliver-after-pickup', action='store_true',
                         help='Include the automatic delivery leg in the pickup confirmation')
+    parser.add_argument('--yes', action='store_true',
+                        help='Skip interactive Enter confirmation (used with --auto)')
     args = parser.parse_args()
     if sum((args.stop_at_c, args.arrive_at_c, args.pickup)) > 1:
         parser.error('choose only one of --stop-at-c, --arrive-at-c and --pickup')
@@ -1121,22 +1123,25 @@ def main():
         print(json.dumps({'status': 'READY_TO_CHECK_LIVE_SENSORS', 'plan_id': plan.plan_id,
                           'robot_commands': 0, 'execute_required': True}))
         return
-    if not sys.stdin.isatty():
-        parser.error('real execution requires an interactive terminal to review the printed measurement')
-    try:
-        prompt = ('Enter để lấy pallet, tự giao tới D và hạ càng, Ctrl+C để hủy: '
-                  if args.deliver_after_pickup else
-                  'Kế hoạch đã khóa; Enter để chạy A→C→B và tự nâng 8 cm, Ctrl+C để hủy: '
-                  if args.pickup else
-                  'Kế hoạch đã khóa; Enter để chạy A→C, Ctrl+C để hủy: '
-                  if args.arrive_at_c else
-                  'Kế hoạch đã khóa; Enter để chạy chẩn đoán tới gần C, Ctrl+C để hủy: '
-                  if args.stop_at_c else
-                  'Kế hoạch đã khóa; Enter để kiểm tra cảm biến và chạy, Ctrl+C để hủy: ')
-        input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print('\nĐã hủy; không phát lệnh xe.')
-        return
+    if args.yes:
+        print('Chế độ tự động (--yes): tự bắt đầu chạy A→C→B và nâng càng.', flush=True)
+    else:
+        if not sys.stdin.isatty():
+            parser.error('real execution requires an interactive terminal to review the printed measurement')
+        try:
+            prompt = ('Enter để lấy pallet, tự giao tới D và hạ càng, Ctrl+C để hủy: '
+                      if args.deliver_after_pickup else
+                      'Kế hoạch đã khóa; Enter để chạy A→C→B và tự nâng 8 cm, Ctrl+C để hủy: '
+                      if args.pickup else
+                      'Kế hoạch đã khóa; Enter để chạy A→C, Ctrl+C để hủy: '
+                      if args.arrive_at_c else
+                      'Kế hoạch đã khóa; Enter để chạy chẩn đoán tới gần C, Ctrl+C để hủy: '
+                      if args.stop_at_c else
+                      'Kế hoạch đã khóa; Enter để kiểm tra cảm biến và chạy, Ctrl+C để hủy: ')
+            input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print('\nĐã hủy; không phát lệnh xe.')
+            return
     if args.output.exists() and any(args.output.iterdir()):
         parser.error('choose a fresh output directory')
     # The operator may review the locked plan for an unlimited time. The

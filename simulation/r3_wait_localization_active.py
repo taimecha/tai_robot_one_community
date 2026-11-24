@@ -34,7 +34,7 @@ def readiness(states, now, max_age_s=2.5, *, names=NAMES, expected_state=3):
 
 
 class LifecyclePoll:
-    def __init__(self, clients, *, poll_period_s=.25, recreate_client=None):
+    def __init__(self, clients, *, poll_period_s=.10, recreate_client=None):
         self.clients=clients
         self.poll_period_s=poll_period_s
         self.recreate_client=recreate_client
@@ -128,7 +128,7 @@ def wait_active(poll, timeout, spin, *, clock=time.monotonic, ok=rclpy.ok, repor
         if reason!=last_reason:
             report(waiting+reason)
             last_reason=reason
-        spin(min(.05,max(0.,deadline-clock())))
+        spin(min(.02,max(0.,deadline-clock())))
     report(waiting+'timed out or stopped: '+str(last_reason))
     return False
 

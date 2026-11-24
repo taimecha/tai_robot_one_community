@@ -62,6 +62,32 @@ Visualization Manager:
       Durability Policy: Transient Local
       History Policy: Keep Last
       Depth: 1
+  - Class: rviz_default_plugins/Path
+    Name: Full Planned Trajectory (Start->A->B->D)
+    Enabled: true
+    Topic:
+      Value: /pallet/r3/rviz/planned_trajectory
+      Reliability Policy: Reliable
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Depth: 1
+    Color: 0; 235; 255
+    Line Style: Billboards
+    Line Width: 0.035
+    Buffer Length: 1
+  - Class: rviz_default_plugins/Path
+    Name: Full Actual Trajectory (Start->End)
+    Enabled: true
+    Topic:
+      Value: /pallet/r3/rviz/actual_trajectory
+      Reliability Policy: Reliable
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Depth: 1
+    Color: 255; 40; 220
+    Line Style: Billboards
+    Line Width: 0.04
+    Buffer Length: 1
   - Class: rviz_default_plugins/LaserScan
     Name: LiDAR /scan_filtered
     Enabled: true

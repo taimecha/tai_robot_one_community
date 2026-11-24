@@ -140,7 +140,7 @@ class DeliveryMission(RecognitionGoal):
             reply = self.await_future(switch.call_async(Trigger.Request()), time.monotonic()+5.)
             if not reply.success:
                 reason = 'Chưa bàn giao định vị sang Nav2: '+reply.message
-                next_attempt = time.monotonic()+.5
+                next_attempt = time.monotonic()+.15
                 raise ValueError(reason)
             return json.loads(reply.message)
 

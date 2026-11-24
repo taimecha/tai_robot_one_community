@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import signal
 import threading
 import time
 
@@ -566,10 +567,14 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_stop = threading.Event()
+    def on_term(*_):
+        spin_stop.set()
+        executor.wake()
+    signal.signal(signal.SIGTERM, on_term)
     def spin():
         try:
             while not spin_stop.is_set() and rclpy.ok():
-                executor.spin_once(timeout_sec=.1)
+                executor.spin_once(timeout_sec=.05)
         except ExternalShutdownException:
             pass
         except RuntimeError:
@@ -579,7 +584,7 @@ def main():
     thread.start()
     next_at = 0.0
     try:
-        while rclpy.ok():
+        while rclpy.ok() and not spin_stop.is_set():
             enabled, generation = node.inference_state()
             if not enabled or time.monotonic() < next_at:
                 time.sleep(.01)
@@ -607,7 +612,7 @@ def main():
     finally:
         spin_stop.set()
         executor.wake()
-        thread.join(timeout=2)
+        thread.join(timeout=1)
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():

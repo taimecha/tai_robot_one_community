@@ -27,7 +27,7 @@ from r3_delivery_topics import VELOCITY_TOPICS
 
 
 MAX_SERVICE_ATTEMPTS=3
-MIN_RETRY_INTERVAL_S=.25
+MIN_RETRY_INTERVAL_S=.15
 SOURCE_FIELDS=('run_id','map_file','amcl_stamp_s','cloud_stamp_s','map_pose_xyyaw',
                'map_odom_xyyaw','odom_anchor_xyyaw','covariance_6x6','particle_metrics',
                'particle_pairing','occupancy_map_signature')
@@ -225,7 +225,7 @@ class TrialEnableClient(Node):
             if publishers:owners[topic]=[info.node_name for info in publishers]
         return owners
 
-    def spin_once(self):rclpy.spin_once(self,timeout_sec=.05)
+    def spin_once(self):rclpy.spin_once(self,timeout_sec=.02)
 
 
 def enable_trial(node,map_file,timeout,*,clock=time.monotonic,ok=rclpy.ok):

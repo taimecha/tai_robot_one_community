@@ -441,6 +441,8 @@ class AmclTrialBridge(Node):
         self.create_service(Trigger, '/pallet/r3/localization/enable_trial', self.enable_trial)
         self.create_service(Trigger, '/pallet/r3/localization/enable_delivery_navigation',
                             self.enable_delivery_navigation)
+        self.create_service(Trigger, '/pallet/r3/localization/reset_cycle',
+                            self.reset_cycle)
         self.create_timer(.05, self.tick)
 
     def _check_handoff_context(self, now, *, from_navigation):
@@ -610,6 +612,48 @@ class AmclTrialBridge(Node):
                                      post_pickup_refresh_requested_ros_s=self.delivery_refresh_after)
         response.success = True
         response.message = json.dumps(self.delivery_handoff)
+        return response
+
+    def reset_cycle(self, request, response):
+        """Reset per-cycle handoff flags for a repeat A->B->D cycle without re-running global localization."""
+        now = self.get_clock().now().nanoseconds*1e-9
+        try:
+            if not self.continuous_localization:
+                raise ValueError('reset_cycle requires continuous localization mode')
+            for topic in ('/cmd_vel_nav', '/cmd_vel_nav_checked', '/cmd_vel_localized', '/cmd_vel_smoothed', '/cmd_vel_safe'):
+                publishers = self.get_publishers_info_by_topic(topic)
+                if publishers:
+                    owners = ', '.join(getattr(endpoint, 'node_name', 'unknown') for endpoint in publishers)
+                    raise ValueError(f'command publishers must stop before cycle reset: {topic}: {owners}')
+            self.trial_handoff = None
+            self.delivery_handoff = None
+            self.delivery_refresh_after = None
+            self.navigation_monitor = True
+            self.motion_prediction = None
+            self.last_parked_validation = None
+            prev = self.correction
+            correction = TrialCorrection(bound_total=False, recover_jumps=True)
+            if prev is not None and prev.measurement_ok and prev.baseline is not None:
+                correction.baseline = prev.baseline
+                correction.last_transform = prev.last_transform
+                correction.amcl_stamp = prev.amcl_stamp
+                correction.xy_std = prev.xy_std
+                correction.yaw_std_deg = prev.yaw_std_deg
+                correction.measurement_ok = True
+                correction.reason = 'retained continuous AMCL session for next cycle'
+            self.correction = correction
+            cached, _ = self.stationary_evidence.ready(now)
+            if not cached:
+                self.parking_refresh_armed = True
+            self.get_logger().info('Reset cycle handoff state; keeping existing AMCL localization session')
+            response.success = True
+            response.message = json.dumps(dict(
+                status='CYCLE_RESET', run_id=self.run_id, map_file=self.map_file,
+                at_ros_s=now, stationary_ready=bool(cached),
+            ), allow_nan=False)
+        except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+            response.success = False
+            response.message = str(exc)
         return response
 
     @staticmethod

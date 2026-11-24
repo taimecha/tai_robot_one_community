@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import signal
 import threading
 import time
 
@@ -345,10 +346,14 @@ def main():
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     spin_stop = threading.Event()
+    def on_term(*_):
+        spin_stop.set()
+        executor.wake()
+    signal.signal(signal.SIGTERM, on_term)
     def spin():
         try:
             while not spin_stop.is_set() and rclpy.ok():
-                executor.spin_once(timeout_sec=.1)
+                executor.spin_once(timeout_sec=.05)
         except ExternalShutdownException:
             pass
         except RuntimeError:
@@ -359,7 +364,7 @@ def main():
     last_pair, last_invalid, last_log = time.monotonic(), 0.0, 0.0
     next_measurement, next_preview = 0.0, 0.0
     try:
-        while rclpy.ok():
+        while rclpy.ok() and not spin_stop.is_set():
             if node.r3_tracking_paused:
                 time.sleep(.05)
                 continue
@@ -422,7 +427,7 @@ def main():
     finally:
         spin_stop.set()
         executor.wake()
-        thread.join(timeout=2)
+        thread.join(timeout=1)
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():

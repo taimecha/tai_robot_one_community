@@ -97,6 +97,7 @@ public:
     terminal_braking_ = false;
     terminal_stop_ticks_ = 0;
     rotation_blocked_ = false;
+    goal_sweep_flipped_ = false;
     has_reached_xy_tolerance_ = false;
     // Keep a tripped turn guard across FollowPath retries for the same goal.
     Base::reset();
@@ -141,6 +142,7 @@ public:
       terminal_slow_turn_ = false;
       terminal_braking_ = false;
       terminal_stop_ticks_ = 0;
+      goal_sweep_flipped_ = false;
       has_reached_xy_tolerance_ = false;
     }
     // A blocked sweep may be retried only after a fresh global plan.
@@ -246,21 +248,38 @@ private:
     // latching final yaw; proximity at its launch is not terminal arrival.
     const double goal_yaw_error = wrapAngle(tf2::getYaw(end.orientation));
     const double goal_xy_error = std::hypot(end.position.x, end.position.y);
-    // A straight route may enter the 5 cm XY disk where the final pivot is
+    // A straight route may enter the XY disk while still several centimetres
+    // short of the goal center. Starting a large skid-steer pivot at the outer
+    // rim of xy_tolerance lets a few centimetres of pivot drift push the robot
+    // back outside xy_tolerance and cause back-and-forth turns. Finish
+    // advancing near the goal center when it lies straight ahead.
+    const bool center_approach_defer = !aligning_terminal_yaw_ && !turning_ &&
+      !short_reverse_plan_ && remaining_length <= 0.15 &&
+      goal_xy_error < xy_tolerance && end.position.x > 0.025 &&
+      std::abs(end.position.y) < 0.65 * xy_tolerance &&
+      std::abs(goal_yaw_error) > yaw_tolerance;
+    // A straight route may also enter the XY disk where the final pivot is
     // blocked, yet have a clear last few centimetres and a clear pivot at
     // the exact endpoint. Keep tracking that short line before turning.
-    const bool defer_terminal_pivot = remaining_length <= 0.15 &&
+    const bool blocked_pivot_defer = remaining_length <= 0.15 &&
       goal_xy_error < xy_tolerance && goal_xy_error > 0.015 &&
       end.position.x > 0.015 && std::abs(end.position.y) < 0.9 * xy_tolerance &&
       std::abs(goal_yaw_error) > yaw_tolerance &&
       !chooseRotation(goal_yaw_error,
         [&](double sweep) {return sweepClear(pose, yaw, sweep);});
+    const bool defer_terminal_pivot = center_approach_defer || blocked_pivot_defer;
     if (defer_terminal_pivot) {
       turning_ = false;
       aligning_terminal_yaw_ = false;
     }
+    // During a route-heading turn toward the goal (e.g. after pivot drift
+    // pushed dist > xy_tolerance), require an inner XY margin before switching
+    // back to goal_yaw so skid-steer wobble across xy_tolerance cannot trigger
+    // an endless ping-pong oscillation.
+    const double xy_entry_tolerance = (turning_ && !turning_to_goal_) ?
+      std::min(xy_tolerance, std::max(0.025, 0.55 * xy_tolerance)) : xy_tolerance;
     const bool at_goal = remaining_length <= 0.15 &&
-      goal_xy_error < xy_tolerance && !defer_terminal_pivot;
+      goal_xy_error < xy_entry_tolerance && !defer_terminal_pivot;
     // Match the non-stateful goal checker: real or localization drift beyond
     // XY tolerance during alignment resumes endpoint tracking.
     has_reached_xy_tolerance_ = at_goal;
@@ -414,6 +433,21 @@ private:
         return stop;
       }
       if (!sweepClear(pose, yaw, remaining_)) {
+        if (goal_rotation && !goal_sweep_flipped_) {
+          const double opposite = remaining_ > 0.0 ? remaining_ - 2.0 * kPi : remaining_ + 2.0 * kPi;
+          if (std::abs(opposite) <= StationaryTurnGuard::kMaxSweep && sweepClear(pose, yaw, opposite)) {
+            goal_sweep_flipped_ = true;
+            turning_ = false;
+            terminal_braking_ = true;
+            terminal_stop_ticks_ = 0;
+            RCLCPP_WARN(logger_,
+              "Committed goal sweep blocked by updated costmap; braking to switch once to clear opposite sweep (%.1f deg)",
+              opposite * 180.0 / kPi);
+            geometry_msgs::msg::TwistStamped stop;
+            stop.header = pose.header;
+            return stop;
+          }
+        }
         // Do not silently change direction when fresh observations invalidate
         // the committed sweep. Stop and let planning choose another route.
         turning_ = false;
@@ -544,6 +578,7 @@ private:
   double transient_tf_hold_timeout_{0.0};
   std::optional<std::chrono::steady_clock::time_point> tf_hold_started_;
   bool rotation_blocked_{false};
+  bool goal_sweep_flipped_{false};
   bool turn_limit_exceeded_{false};
   bool have_goal_{false};
   std::string goal_frame_;

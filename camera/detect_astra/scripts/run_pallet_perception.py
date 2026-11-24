@@ -27,7 +27,7 @@ def main():
                 # Remain in the launcher's owned process group: a bounded
                 # restart must also reap a detector stuck in native inference.
                 env=env))
-        while not stopped.wait(.2):
+        while not stopped.wait(.05):
             exited = next((child for child in children if child.poll() is not None), None)
             if exited is not None:
                 code = exited.returncode or 1
@@ -41,7 +41,7 @@ def main():
                 child.send_signal(signal.SIGTERM)
         for child in children:
             try:
-                child.wait(timeout=6)
+                child.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait()

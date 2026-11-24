@@ -1,21 +1,32 @@
-<!-- Keep a valid route; prefer the checked straight-route Smac2D wrapper. -->
+<!-- Keep a valid route; prefer the checked straight-route Smac2D wrapper,
+     with safe non-moving wait + costmap-clear retries for dynamic obstacles. -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <PipelineSequence name="NavigateWithReplanning">
-      <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-      <PlannerSelector selected_planner="{selected_planner}" default_planner="GridShortest" topic_name="planner_selector"/>
-      <RateController hz="1.0">
-        <Fallback>
-          <ReactiveSequence>
-            <Inverter>
-              <GlobalUpdatedGoal/>
-            </Inverter>
-            <IsPathValid path="{path}"/>
-          </ReactiveSequence>
-          <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
-        </Fallback>
-      </RateController>
-      <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
-    </PipelineSequence>
+    <RecoveryNode number_of_retries="8" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridShortest" topic_name="planner_selector"/>
+        <RateController hz="1.0">
+          <Fallback>
+            <ReactiveSequence>
+              <Inverter>
+                <GlobalUpdatedGoal/>
+              </Inverter>
+              <IsPathValid path="{path}"/>
+            </ReactiveSequence>
+            <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+          </Fallback>
+        </RateController>
+        <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+      </PipelineSequence>
+      <Sequence name="DynamicObstacleWaitRecovery">
+        <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+        <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+        <Wait wait_duration="2.0"/>
+      </Sequence>
+    </RecoveryNode>
   </BehaviorTree>
 </root>
